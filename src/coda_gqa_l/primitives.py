@@ -123,3 +123,14 @@ def _sdpa_supports_enable_gqa() -> bool:
 
 
 SDPA_ENABLE_GQA: bool = _sdpa_supports_enable_gqa()
+
+
+def compute_lf_start(head_dim: int) -> int:
+    """Return the dimension index where the low-frequency RoPE band begins.
+
+    RoPE pair i rotates dims (2i, 2i+1) with frequency 1/base^(2i/d).
+    Lower pairs rotate faster (position-sensitive HF); higher pairs rotate
+    slower (position-invariant LF).  The split at head_dim // 2 assigns the
+    slower half of pairs to the LF band used for Phase-Safe EMA routing.
+    """
+    return head_dim // 2

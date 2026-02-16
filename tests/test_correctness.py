@@ -322,3 +322,38 @@ def test_head_stacked_sdpa_matches_separate():
         f"Head-stacked SDPA output differs from separate calls by {diff:.6f}. "
         f"GQA head alignment may be broken."
     )
+
+
+# ---------------------------------------------------------------------------
+# 12. test_summary_bank_hf_zero (Phase-Safe EMA invariant)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_summary_bank_hf_zero():
+    """Summary bank keys maintain zero HF band after Phase-Safe EMA updates.
+
+    The high-frequency key dimensions (0..lf_start-1) are initialized to zero
+    and must remain zero after evictions trigger EMA blending in the summary
+    bank.  This validates the Phase-Safe EMA invariant: only the LF band is
+    blended, HF is never written.
+    """
+    B = 1
+    model = _make_model()
+    state = model.init_state(batch_size=B, device=DEVICE, dtype=DTYPE)
+    lf = model.lf_start
+    s = model.window + model.Me
+    e = model.Lbuf
+
+    # HF band should be zero at init
+    assert state.k_buf[:, :, s:e, :lf].abs().max() == 0, "HF should be zero at init"
+
+    # Prefill enough tokens to trigger evictions into summary bank
+    x = _rand_input(B, 512)
+    _, state = model.prefill_chunked(x, state, block_size=128, write_cache=True, return_outputs=False)
+
+    hf_max = state.k_buf[:, :, s:e, :lf].abs().max().item()
+    assert hf_max < 1e-6, (
+        f"Summary bank HF band should remain zero after Phase-Safe EMA, "
+        f"got max abs = {hf_max}"
+    )

@@ -18,12 +18,19 @@ from .state import CoDAGQALandmarkStatePerf2
 class MemoryBankMixin:
     """Memory bank update methods, mixed into CoDAGQALandmarkPerf2.
 
-    V-routing: cosine similarity for memory bank matching uses Values (V),
-    not Keys (K).  Keys have RoPE applied at write time, making their cosine
-    similarity position-dependent -- identical tokens at different positions
-    produce near-zero similarity.  Values are RoPE-free and preserve pure
-    semantic content, enabling correct deduplication in the exact bank and
-    meaningful EMA blending in the summary bank.
+    Frequency-aware routing and EMA:
+      - Exact bank: V-routing (cosine similarity on Values, RoPE-free) for
+        semantic deduplication.  Full key overwrites, no EMA, no phase issue.
+      - Summary bank: LF-K routing (cosine similarity on low-frequency key
+        band).  Phase-Safe EMA blends only the LF band of keys; HF band stays
+        zero.  Values use full EMA (no RoPE, no phase issue).  Energy
+        calibration scales the LF band by sqrt(Dh / Dh_lf) to compensate for
+        reduced dimensionality.
+
+    RoPE splits key dimensions into high-frequency (position-sensitive, HF)
+    and low-frequency (position-invariant, LF) bands.  EMA-blending HF keys
+    from different positions causes destructive interference (Prism, 2026).
+    Phase-Safe EMA avoids this by zeroing the HF band and only blending LF.
 
     Provides:
       - Scratch buffer management (_get_scratch)
@@ -319,10 +326,11 @@ class MemoryBankMixin:
 
         mem_k, mem_v, used = self._view_sum(state)
 
-        # V-routing: cosine similarity on Values (RoPE-free) for semantic matching.
-        v_n = F.normalize(v_evict, dim=-1, eps=1e-6)
-        mem_n = state._sum_v_norm
-        scores_h = torch.einsum("bhd,bhmd->bhm", v_n, mem_n)
+        # LF-K routing: cosine similarity on low-frequency key band.
+        lf = self.lf_start
+        k_lf_n = F.normalize(k_evict[..., lf:], dim=-1, eps=1e-6)
+        mem_n = state._sum_lf_k_norm
+        scores_h = torch.einsum("bhd,bhmd->bhm", k_lf_n, mem_n)
         scores = scores_h.mean(dim=1)
         idx = scores.argmax(dim=-1)
 
@@ -343,7 +351,12 @@ class MemoryBankMixin:
         w.scatter_(1, idx.view(B, 1), 1.0)
         w4 = w[:, None, :, None]
 
-        mem_k = mem_k + eta * w4 * (k_evict.unsqueeze(2) - mem_k)
+        # Phase-Safe EMA: only blend LF key band; HF stays zero.
+        delta_k = torch.zeros_like(mem_k)
+        incoming_lf = k_evict[..., lf:].unsqueeze(2) * self.energy_scale
+        delta_k[..., lf:] = incoming_lf - mem_k[..., lf:]
+        mem_k = mem_k + eta * w4 * delta_k
+        # Values: full EMA (RoPE-free, no phase issue)
         mem_v = mem_v + eta * w4 * (v_evict.unsqueeze(2) - mem_v)
         used = used | (keep_b.view(B, 1) & w.to(torch.bool))
 
@@ -353,8 +366,8 @@ class MemoryBankMixin:
         state.v_buf[:, :, s:e, :] = mem_v
         state.allowed[:, s:e] = used
 
-        # Update V-routing norm cache
-        state._sum_v_norm = F.normalize(mem_v, dim=-1, eps=1e-6)
+        # Update LF-K routing norm cache
+        state._sum_lf_k_norm = F.normalize(mem_k[..., lf:], dim=-1, eps=1e-6)
 
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:
@@ -424,8 +437,10 @@ class MemoryBankMixin:
                 v_sel_all = v_e.gather(2, idx_exp_all)
                 pos_sel_all = pos_e.gather(1, idxs_all)
 
-                # V-routing: normalize values once, share across both banks
+                # V-routing norms for exact bank (full values, RoPE-free)
                 v_sel_norm_all = F.normalize(v_sel_all, dim=-1, eps=1e-6)
+                # LF-K routing norms for summary bank (LF key band only)
+                lf_k_sel_norm_all = F.normalize(k_sel_all[..., self.lf_start:], dim=-1, eps=1e-6)
 
                 # Exact bank uses first Te candidates
                 self._exact_update_block_vectorized(
@@ -452,7 +467,7 @@ class MemoryBankMixin:
 
                 self._summary_update_block_hard(
                     state, k_sel=k_sel_s, v_sel=v_sel_s, pos_sel=pos_sel_s, w_tok=w_tok,
-                    v_sel_norm=v_sel_norm_all[:, :, :Ts, :],
+                    lf_k_sel_norm=lf_k_sel_norm_all[:, :, :Ts, :],
                 )
 
             elif need_exact:
@@ -647,12 +662,13 @@ class MemoryBankMixin:
         v_sel: torch.Tensor,
         pos_sel: torch.Tensor,
         w_tok: torch.Tensor,
-        v_sel_norm: Optional[torch.Tensor] = None,
+        lf_k_sel_norm: Optional[torch.Tensor] = None,
     ) -> None:
         """Update summary landmark bank with evicted token candidates.
 
-        V-routing: cosine similarity uses Values (RoPE-free) for semantic
-        matching.  Uses scratch buffers and cached normalized memory values.
+        LF-K routing: cosine similarity on low-frequency key band for semantic
+        matching.  Phase-Safe EMA blends only LF keys; HF stays zero.
+        Uses scratch buffers and cached normalized memory values.
         Zero-weight tokens produce zero scatter contributions.
         """
         if self.Ms == 0:
@@ -664,13 +680,15 @@ class MemoryBankMixin:
 
         mem_k, mem_v, used = self._view_sum(state)
 
-        # V-routing: cosine similarity on Values (RoPE-free) for semantic matching.
-        if v_sel_norm is None:
-            v_sel_norm = F.normalize(v_sel, dim=-1, eps=1e-6)
-        mem_n = state._sum_v_norm  # cached; updated on writes
+        # LF-K routing: cosine similarity on low-frequency key band.
+        lf = self.lf_start
+        Dh_lf = Dh - lf
+        if lf_k_sel_norm is None:
+            lf_k_sel_norm = F.normalize(k_sel[..., lf:], dim=-1, eps=1e-6)
+        mem_n = state._sum_lf_k_norm  # cached; updated on writes
         scores_h = torch.matmul(
-            v_sel_norm.reshape(B * Hkv, T, Dh),
-            mem_n.reshape(B * Hkv, Ms, Dh).transpose(1, 2),
+            lf_k_sel_norm.reshape(B * Hkv, T, Dh_lf),
+            mem_n.reshape(B * Hkv, Ms, Dh_lf).transpose(1, 2),
         ).view(B, Hkv, T, Ms)
         scores = scores_h.mean(dim=1)
         idx_tok = scores.argmax(dim=-1)
@@ -707,8 +725,11 @@ class MemoryBankMixin:
         else:
             eta_eff = eta
 
-        # EMA blend: mem = mem + eta * (avg - mem) = (1-eta)*mem + eta*avg
-        mem_k = torch.where(active, mem_k + eta_eff * (avg_k - mem_k), mem_k)
+        # Phase-Safe EMA: only blend LF key band; HF stays zero.
+        delta_k = torch.zeros_like(avg_k)
+        delta_k[..., lf:] = avg_k[..., lf:] * self.energy_scale - mem_k[..., lf:]
+        mem_k = torch.where(active, mem_k + eta_eff * delta_k, mem_k)
+        # Values: full EMA (RoPE-free, no phase issue)
         mem_v = torch.where(active, mem_v + eta_eff * (avg_v - mem_v), mem_v)
         used = used | (count > 0)
 
@@ -718,8 +739,8 @@ class MemoryBankMixin:
         state.v_buf[:, :, s:e, :] = mem_v
         state.allowed[:, s:e] = used
 
-        # Update V-routing norm cache for EMA-blended slots
-        state._sum_v_norm = F.normalize(mem_v, dim=-1, eps=1e-6)
+        # Update LF-K routing norm cache for EMA-blended slots
+        state._sum_lf_k_norm = F.normalize(mem_k[..., lf:], dim=-1, eps=1e-6)
 
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:

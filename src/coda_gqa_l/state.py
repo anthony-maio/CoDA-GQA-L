@@ -15,8 +15,10 @@ class CoDAGQALandmarkStatePerf2:
 
     Buffer layout: [recent W | exact Me | summary Ms]
     RoPE is already applied to keys stored in k_buf.
-    Routing (cosine similarity) uses values (V), not keys (K),
-    because RoPE makes key similarity position-dependent.
+    Routing strategies:
+      - Exact bank: V-routing (cosine similarity on Values, RoPE-free).
+      - Summary bank: LF-K routing (cosine similarity on low-frequency key band).
+    Summary bank keys have zero HF band (Phase-Safe EMA).
     """
 
     k_buf: torch.Tensor       # (B, Hkv, Lbuf, Dh)
@@ -34,13 +36,11 @@ class CoDAGQALandmarkStatePerf2:
     # Absolute position of next token to be written
     pos: int
 
-    # Cached normalized memory values for cosine similarity routing.
-    # Routing uses V (not K) because keys have RoPE applied, making cosine
-    # similarity position-dependent.  Values are RoPE-free and preserve
-    # pure semantic content for deduplication and EMA blending.
-    # Updated slot-wise on writes, avoiding full F.normalize(mem_v) per block.
+    # Cached normalized routing targets, updated slot-wise on writes.
+    # Exact bank: normalized values (V-routing, RoPE-free).
+    # Summary bank: normalized LF key band (LF-K routing, position-invariant).
     _exact_v_norm: Optional[torch.Tensor] = field(default=None, repr=False)
-    _sum_v_norm: Optional[torch.Tensor] = field(default=None, repr=False)
+    _sum_lf_k_norm: Optional[torch.Tensor] = field(default=None, repr=False)
 
     # Optional lightweight metrics counters.  None means disabled (zero overhead).
     # When enabled, a dict of string -> int/float counters tracking bank activity.

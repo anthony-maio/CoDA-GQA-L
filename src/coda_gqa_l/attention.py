@@ -12,7 +12,8 @@
 #   - Single SDPA call via head-stacking (signal + noise queries)
 #   - Vectorized block memory updates (scatter_reduce/scatter_add)
 #   - RoPE applied at write time (no per-step re-rotation)
-#   - V-routing: cosine similarity uses Values (RoPE-free) not Keys
+#   - Frequency-aware routing: exact bank uses V-routing, summary bank uses LF-K routing
+#   - Phase-Safe EMA: summary bank blends only LF key band (HF zeroed)
 
 from __future__ import annotations
 
@@ -105,6 +106,11 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even (RoPE requirement)")
 
+        # Frequency-aware split: LF band (position-invariant) starts at head_dim // 2.
+        self.lf_start = self.head_dim // 2
+        self.lf_dim = self.head_dim - self.lf_start
+        self.energy_scale = math.sqrt(self.head_dim / self.lf_dim)
+
         self.window = int(window)
         self.Me = int(num_landmarks_exact)
         self.Ms = int(num_landmarks_summary)
@@ -180,7 +186,8 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
                 k_buf[:, :, self.window:self.window + self.Me, :].normal_(mean=0.0, std=0.02)
                 v_buf[:, :, self.window:self.window + self.Me, :].normal_(mean=0.0, std=0.02)
             if self.Ms > 0:
-                k_buf[:, :, self.window + self.Me:, :].normal_(mean=0.0, std=0.02)
+                # Phase-Safe: HF key band stays zero, only LF band is initialized.
+                k_buf[:, :, self.window + self.Me:, self.lf_start:].normal_(mean=0.0, std=0.02)
                 v_buf[:, :, self.window + self.Me:, :].normal_(mean=0.0, std=0.02)
         elif self.mem_init == "zeros":
             pass
@@ -198,16 +205,16 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
             pos=0,
         )
 
-        # Initialize cached normalized memory values for V-routing.
-        # Routing uses V (not K) because keys have RoPE applied, making
-        # cosine similarity position-dependent and breaking semantic matching.
+        # Initialize cached normalized routing targets.
+        # Exact bank: V-routing (RoPE-free values preserve semantic matching).
+        # Summary bank: LF-K routing (low-frequency key band is position-invariant).
         if self.Me > 0:
             state._exact_v_norm = F.normalize(
                 v_buf[:, :, self.window:self.window + self.Me, :], dim=-1, eps=1e-6
             ).clone()
         if self.Ms > 0:
-            state._sum_v_norm = F.normalize(
-                v_buf[:, :, self.window + self.Me:, :], dim=-1, eps=1e-6
+            state._sum_lf_k_norm = F.normalize(
+                k_buf[:, :, self.window + self.Me:, self.lf_start:], dim=-1, eps=1e-6
             ).clone()
 
         # Initialize lightweight metrics counters when collection is enabled.
