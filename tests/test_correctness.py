@@ -271,3 +271,54 @@ def test_batch_size_two():
         assert y_dec.shape == (B, 1, EMBED_DIM), f"Decode step {i} shape mismatch for B=2"
 
     assert state.pos == L_prefill + 5
+
+
+# ---------------------------------------------------------------------------
+# 11. test_head_stacked_sdpa_matches_separate (GQA alignment regression)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_head_stacked_sdpa_matches_separate():
+    """Head-stacked two-stream SDPA must match two separate SDPA calls.
+
+    Regression test for GQA head alignment bug: repeat_kv(k, 2*groups)
+    breaks the GQA head mapping when num_heads > num_kv_heads.  The
+    correct approach is repeat_kv(k, groups) then cat for the two streams.
+    """
+    import torch.nn.functional as F
+    from coda_gqa_l.primitives import repeat_kv
+
+    torch.manual_seed(42)
+    B, L, Dh = 1, 32, 32
+    H, Hkv = 4, 2
+    groups = H // Hkv
+
+    model = _make_model()
+
+    # Random Q, K, V in head-space
+    q_sig = torch.randn(B, H, L, Dh)
+    q_noise = torch.randn(B, H, L, Dh)
+    k = torch.randn(B, Hkv, L, Dh)
+    v = torch.randn(B, Hkv, L, Dh)
+    lam = torch.sigmoid(torch.randn(B, H, L, 1))
+
+    # --- Reference: two separate SDPA calls (like CoDAGQA.forward) ---
+    k_rep_ref = repeat_kv(k, groups)   # (B, H, L, Dh)
+    v_rep_ref = repeat_kv(v, groups)
+    out_sig_ref = F.scaled_dot_product_attention(q_sig, k_rep_ref, v_rep_ref, is_causal=True)
+    out_noise_ref = F.scaled_dot_product_attention(q_noise, k_rep_ref, v_rep_ref, is_causal=True)
+    out_ref = out_sig_ref - lam * out_noise_ref
+    out_ref = model.head_norm(out_ref)
+
+    # --- Under test: head-stacked SDPA ---
+    out_stacked = model._sdpa_stacked_two_stream(
+        q=q_sig, q_noise=q_noise, k=k, v=v,
+        attn_mask=None, lam=lam, is_causal=True,
+    )
+
+    diff = (out_stacked - out_ref).abs().max().item()
+    assert diff < 1e-4, (
+        f"Head-stacked SDPA output differs from separate calls by {diff:.6f}. "
+        f"GQA head alignment may be broken."
+    )

@@ -263,13 +263,18 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
     ) -> torch.Tensor:
         q_cat = torch.cat([q, q_noise], dim=1)  # (B,2H,Lq,Dh)
 
-        # Always use repeat_kv rather than enable_gqa=True.
-        # enable_gqa=True blocks MemEfficient and Flash backends in PyTorch SDPA,
-        # forcing fallback to Math kernel. repeat_kv uses expand+reshape (no copy)
-        # and unlocks the fast backends.
-        num_repeat = (2 * self.num_heads) // self.num_kv_heads
-        k_rep = repeat_kv(k, num_repeat)
-        v_rep = repeat_kv(v, num_repeat)
+        # GQA head alignment for stacked two-stream attention:
+        # q_cat = [sig_h0..sig_h{H-1}, noise_h0..noise_h{H-1}]
+        # We need each signal head and its noise counterpart to attend
+        # to the SAME KV head.  First expand KV for normal GQA (Hkv→H),
+        # then duplicate for the noise stream (H→2H).
+        # This gives [kv0xG, kv1xG, ..., kv0xG, kv1xG, ...] which
+        # correctly aligns with [signal heads | noise heads].
+        groups = self.num_heads // self.num_kv_heads
+        k_gqa = repeat_kv(k, groups)   # (B, H, Lk, Dh)
+        v_gqa = repeat_kv(v, groups)   # (B, H, Lk, Dh)
+        k_rep = torch.cat([k_gqa, k_gqa], dim=1)  # (B, 2H, Lk, Dh)
+        v_rep = torch.cat([v_gqa, v_gqa], dim=1)  # (B, 2H, Lk, Dh)
         out_cat = F.scaled_dot_product_attention(
             q_cat, k_rep, v_rep, attn_mask=attn_mask, is_causal=is_causal,
         )
