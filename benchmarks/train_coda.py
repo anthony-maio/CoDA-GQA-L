@@ -254,12 +254,20 @@ def switch_to_bounded(
     num_landmarks_exact: int = 64,
     num_landmarks_summary: int = 64,
     block_size: int = 256,
+    detach_evicted: bool = True,
 ) -> Tuple[nn.Module, List[LlamaCoDAAdapter]]:
     """Switch unbounded adapters to bounded, copying all trained weights.
 
     Creates new bounded LlamaCoDAAdapters, copies shared weights (Q/K/V/O
     projections, lambda_proj, theta, head_norm) from the unbounded adapters.
     Bounded-only params (write_proj, summary_eta_logit) start at their defaults.
+
+    Args:
+        detach_evicted: If True (default), evicted tokens are detached before
+            writing to memory banks, blocking gradients through the bank update
+            path.  Set False to allow write_proj and summary_eta_logit to
+            receive gradients during training (experimental -- may increase
+            memory and cause gradient instability).
 
     Returns (model, bounded_adapters).
     """
@@ -282,6 +290,7 @@ def switch_to_bounded(
             num_landmarks_exact=num_landmarks_exact,
             num_landmarks_summary=num_landmarks_summary,
             block_size=block_size,
+            detach_evicted=detach_evicted,
         )
         adapter_b = adapter_b.to(device=device, dtype=dtype)
         coda_b = adapter_b.coda
@@ -404,7 +413,11 @@ def eval_ppl(
     max_length: int = 2048,
     stride: int = 512,
 ) -> float:
-    """Compute perplexity on pre-tokenized eval data."""
+    """Compute perplexity on pre-tokenized eval data (unbounded models only).
+
+    Uses overlapping sliding window for efficient PPL estimation.
+    NOT suitable for bounded/stateful models -- use eval_ppl_sequential instead.
+    """
     was_training = model.training
     model.eval()
 
@@ -445,6 +458,65 @@ def eval_ppl(
 
 
 @torch.no_grad()
+def eval_ppl_sequential(
+    model: nn.Module,
+    adapters: List[LlamaCoDAAdapter],
+    eval_tokens: torch.Tensor,
+    device: torch.device,
+    chunk_size: int = 2048,
+    max_tokens: int = 0,
+) -> float:
+    """Evaluate perplexity with non-overlapping sequential chunks.
+
+    Suitable for bounded/stateful models:
+    - Resets adapter state before starting
+    - Processes chunks sequentially without overlap
+    - Each chunk sees memory bank content from all previous chunks
+
+    Also works for unbounded models (each chunk only sees its own context).
+    """
+    was_training = model.training
+    model.eval()
+
+    # Reset adapter states for clean eval.
+    reset_adapter_states(adapters)
+
+    tokens = eval_tokens[:max_tokens] if max_tokens > 0 else eval_tokens
+    input_ids = tokens.unsqueeze(0).to(device)
+    seq_len = input_ids.size(1)
+
+    nlls: List[torch.Tensor] = []
+    n_tokens = 0
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        if end - start < 2:
+            break
+        chunk = input_ids[:, start:end]
+        outputs = model(chunk, use_cache=False)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+
+        shift_logits = logits[:, :-1].contiguous()
+        shift_labels = chunk[:, 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            reduction="none",
+        )
+        nlls.append(loss.sum())
+        n_tokens += loss.numel()
+
+    ppl = torch.exp(torch.stack(nlls).sum() / n_tokens).item()
+
+    # Reset state after eval.
+    reset_adapter_states(adapters)
+
+    if was_training:
+        model.train()
+    return ppl
+
+
+@torch.no_grad()
 def eval_bounded_ppl(
     model: nn.Module,
     adapters: List[LlamaCoDAAdapter],
@@ -456,19 +528,36 @@ def eval_bounded_ppl(
     Me: int = 64,
     Ms: int = 64,
     block_size: int = 256,
-    chunk_size: int = 512,
+    chunk_size: int = 2048,
     max_tokens: int = 20_000,
 ) -> float:
     """Evaluate with bounded CoDA attention by transferring trained weights.
 
-    Creates bounded adapters, copies trained Q/K/V/O + CoDA weights from the
-    unbounded adapters, then runs streaming PPL evaluation. Bounded-only params
-    (write gate, EMA eta) use their default initialization.
+    For Phase 1 (unbounded adapters): Creates bounded adapters, copies trained
+    Q/K/V/O + CoDA weights. Bounded-only params (write gate, EMA eta) use
+    their default initialization.
+
+    For Phase 2 (bounded adapters): Evaluates the model directly since adapters
+    are already bounded with trained params.
     """
+    is_already_bounded = adapters and adapters[0].bounded
+
+    if is_already_bounded:
+        # Phase 2: model already has bounded adapters with trained params.
+        # Just use eval_ppl_sequential directly.
+        return eval_ppl_sequential(
+            model, adapters, eval_tokens, device,
+            chunk_size=chunk_size,
+            max_tokens=max_tokens,
+        )
+
+    # Phase 1: create bounded copies from unbounded adapters.
     import copy
 
     model_b = copy.deepcopy(model)
     model_b.eval()
+
+    bounded_adapters: List[LlamaCoDAAdapter] = []
 
     # Replace each unbounded adapter with a bounded one using trained weights.
     for i, block in enumerate(model_b.model.layers):
@@ -508,33 +597,14 @@ def eval_bounded_ppl(
                 coda_b.head_norm.load_state_dict(coda_ub.head_norm.state_dict())
 
         block.self_attn = adapter_b
+        bounded_adapters.append(adapter_b)
 
     # Streaming PPL on a subset of eval data.
-    input_ids = eval_tokens[:max_tokens].unsqueeze(0).to(device)
-    seq_len = input_ids.size(1)
-
-    nlls: List[torch.Tensor] = []
-    n_tokens = 0
-
-    for start in range(0, seq_len, chunk_size):
-        end = min(start + chunk_size, seq_len)
-        if end - start < 2:
-            break
-        chunk = input_ids[:, start:end]
-        outputs = model_b(chunk, use_cache=False)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-
-        shift_logits = logits[:, :-1].contiguous()
-        shift_labels = chunk[:, 1:].contiguous()
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            reduction="none",
-        )
-        nlls.append(loss.sum())
-        n_tokens += loss.numel()
-
-    ppl = torch.exp(torch.stack(nlls).sum() / n_tokens).item()
+    ppl = eval_ppl_sequential(
+        model_b, bounded_adapters, eval_tokens, device,
+        chunk_size=chunk_size,
+        max_tokens=max_tokens,
+    )
 
     del model_b
     if device.type == "cuda":
@@ -614,6 +684,9 @@ def train(
         chunk_idx += batch_size
         return batch
 
+    # Detect if we're in bounded training mode (adapters have bounded=True).
+    is_bounded_training = adapters and adapters[0].bounded
+
     log: List[Dict[str, Any]] = []
     best_ppl = float("inf")
     t0 = time.time()
@@ -622,16 +695,20 @@ def train(
 
     # Initial eval.
     if eval_tokens is not None:
-        ppl0 = eval_ppl(model, eval_tokens, device, max_length=seq_len)
-        print(f"  Step 0: eval PPL = {ppl0:.2f}")
+        if is_bounded_training:
+            ppl0 = eval_ppl_sequential(
+                model, adapters, eval_tokens, device,
+                chunk_size=seq_len, max_tokens=eval_bounded_tokens,
+            )
+            print(f"  Step 0: eval PPL (bounded) = {ppl0:.2f}")
+        else:
+            ppl0 = eval_ppl(model, eval_tokens, device, max_length=seq_len)
+            print(f"  Step 0: eval PPL = {ppl0:.2f}")
         log.append({"step": 0, "eval_ppl": round(ppl0, 2)})
         best_ppl = ppl0
 
     optimizer.zero_grad()
     print_every = max(grad_accum * 5, grad_accum)
-
-    # Detect if we're in bounded training mode (adapters have bounded=True).
-    is_bounded_training = adapters and adapters[0].bounded
 
     for step in range(1, max_steps + 1):
         input_ids = get_batch()
@@ -694,9 +771,17 @@ def train(
 
         # Periodic eval.
         if eval_every and step % eval_every == 0 and eval_tokens is not None:
-            ppl = eval_ppl(model, eval_tokens, device, max_length=seq_len)
+            if is_bounded_training:
+                ppl = eval_ppl_sequential(
+                    model, adapters, eval_tokens, device,
+                    chunk_size=seq_len, max_tokens=eval_bounded_tokens,
+                )
+                label = "bounded"
+            else:
+                ppl = eval_ppl(model, eval_tokens, device, max_length=seq_len)
+                label = "unbounded"
             marker = "best" if ppl < best_ppl else f"+{ppl - best_ppl:.2f}"
-            print(f"  Step {step}: eval PPL = {ppl:.2f} ({marker})")
+            print(f"  Step {step}: eval PPL ({label}) = {ppl:.2f} ({marker})")
             log.append({"step": step, "eval_ppl": round(ppl, 2)})
             if ppl < best_ppl:
                 best_ppl = ppl
@@ -706,25 +791,41 @@ def train(
         if save_every and step % save_every == 0:
             save_checkpoint(adapters, output_dir / f"step_{step}", step, log)
 
-    # Final unbounded eval.
+    # Final eval.
     if eval_tokens is not None:
-        final_ppl = eval_ppl(model, eval_tokens, device, max_length=seq_len)
-        print(f"\n  Final eval PPL (unbounded): {final_ppl:.2f}")
-        log.append({"step": max_steps, "eval_ppl": round(final_ppl, 2), "final": True})
+        if is_bounded_training:
+            # Phase 2: model already has bounded adapters, eval directly.
+            final_ppl = eval_ppl_sequential(
+                model, adapters, eval_tokens, device,
+                chunk_size=seq_len, max_tokens=eval_bounded_tokens,
+            )
+            print(f"\n  Final eval PPL (bounded): {final_ppl:.2f}")
+            log.append({
+                "step": max_steps,
+                "eval_ppl": round(final_ppl, 2),
+                "bounded_ppl": round(final_ppl, 2),
+                "bounded_config": "in-place",
+                "final": True,
+            })
+        else:
+            # Phase 1: unbounded eval + optional bounded projection.
+            final_ppl = eval_ppl(model, eval_tokens, device, max_length=seq_len)
+            print(f"\n  Final eval PPL (unbounded): {final_ppl:.2f}")
+            log.append({"step": max_steps, "eval_ppl": round(final_ppl, 2), "final": True})
 
-    # Bounded eval — the key metric.
-    if eval_bounded and eval_tokens is not None:
-        print(f"\n  Evaluating bounded PPL (W=256, Me=64, Ms=64)...")
-        bounded_ppl = eval_bounded_ppl(
-            model, adapters, eval_tokens, device, dtype,
-            max_tokens=eval_bounded_tokens,
-        )
-        print(f"  Bounded PPL: {bounded_ppl:.2f}")
-        log.append({
-            "step": max_steps,
-            "bounded_ppl": round(bounded_ppl, 2),
-            "bounded_config": "medium",
-        })
+            if eval_bounded:
+                print(f"\n  Evaluating bounded PPL (W=256, Me=64, Ms=64)...")
+                bounded_ppl = eval_bounded_ppl(
+                    model, adapters, eval_tokens, device, dtype,
+                    max_tokens=eval_bounded_tokens,
+                    chunk_size=seq_len,
+                )
+                print(f"  Bounded PPL: {bounded_ppl:.2f}")
+                log.append({
+                    "step": max_steps,
+                    "bounded_ppl": round(bounded_ppl, 2),
+                    "bounded_config": "medium",
+                })
 
     # Save final checkpoint + log.
     save_checkpoint(adapters, output_dir / "final", max_steps, log)
@@ -834,6 +935,10 @@ Examples:
                     help="LR scale factor for Phase 2 (relative to Phase 1 final LR).")
     p.add_argument("--bounded-block-size", type=int, default=256,
                     help="Block size for bounded prefill during training.")
+    p.add_argument("--no-detach-evicted", action="store_true",
+                    help="Allow gradients through memory bank updates in Phase 2. "
+                         "Enables write_proj and summary_eta_logit to receive gradients. "
+                         "Experimental: may increase memory usage.")
 
     # Hardware.
     p.add_argument("--dtype", type=str, default="bf16",
@@ -966,12 +1071,16 @@ def main() -> None:
         save_checkpoint(adapters, output_dir / "phase1_final", args.max_steps, log)
 
         # Switch all adapters from unbounded to bounded.
+        detach = not args.no_detach_evicted
+        if not detach:
+            print("  detach_evicted=False: gradients flow through memory bank updates")
         model, adapters_b = switch_to_bounded(
             model, adapters, device, dtype,
             window=bcfg["window"],
             num_landmarks_exact=bcfg["Me"],
             num_landmarks_summary=bcfg["Ms"],
             block_size=args.bounded_block_size,
+            detach_evicted=detach,
         )
 
         # Gradient checkpointing on the new adapters.
@@ -993,8 +1102,9 @@ def main() -> None:
 
         # Phase 2 eval before training (bounded PPL baseline).
         if eval_tokens is not None:
-            ppl_p2_start = eval_bounded_ppl(
-                model, adapters_b, eval_tokens, device, dtype,
+            ppl_p2_start = eval_ppl_sequential(
+                model, adapters_b, eval_tokens, device,
+                chunk_size=args.seq_len,
                 max_tokens=args.eval_bounded_tokens,
             )
             print(f"  Phase 2 start bounded PPL: {ppl_p2_start:.2f}")
