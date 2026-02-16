@@ -45,22 +45,35 @@ class MemoryBankMixin:
     # Scratch buffers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _new_scratch(B: int, Hkv: int, Me: int, Ms: int, Dh: int, device: torch.device, dtype: torch.dtype) -> dict:
+        """Allocate a fresh set of scratch buffers."""
+        return {
+            'exact_sum_k': torch.zeros(B, Hkv, Me, Dh, device=device, dtype=dtype),
+            'exact_sum_v': torch.zeros(B, Hkv, Me, Dh, device=device, dtype=dtype),
+            'exact_upd': torch.zeros(B, Me, device=device, dtype=dtype),
+            'exact_max_score': torch.empty(B, Me, device=device, dtype=torch.float32),
+            'exact_max_pos': torch.empty(B, Me, device=device, dtype=torch.int64),
+            'exact_pos_slot': torch.zeros(B, Me, device=device, dtype=torch.int64),
+            'sum_count': torch.zeros(B, Ms, device=device, dtype=dtype),
+            'sum_sum_k': torch.zeros(B, Hkv, Ms, Dh, device=device, dtype=dtype),
+            'sum_sum_v': torch.zeros(B, Hkv, Ms, Dh, device=device, dtype=dtype),
+        }
+
     def _get_scratch(self, B: int, Hkv: int, Dh: int, device: torch.device, dtype: torch.dtype) -> dict:
-        """Lazily allocate and return reusable scratch tensors for bank updates."""
+        """Lazily allocate and return reusable scratch tensors for bank updates.
+
+        When ``detach_evicted=False``, returns **fresh** buffers every call.
+        Reusing scratch across chunks causes autograd version conflicts:
+        ``zero_()`` + ``scatter_add_()`` on graph-connected tensors increment
+        the version counter, and the next chunk's ``zero_()`` invalidates the
+        prior chunk's saved state for backward.
+        """
+        if not self.detach_evicted:
+            return self._new_scratch(B, Hkv, self.Me, self.Ms, Dh, device, dtype)
         key = (B, Hkv, Dh, device, dtype)
         if key not in self._scratch:
-            Me, Ms = self.Me, self.Ms
-            self._scratch[key] = {
-                'exact_sum_k': torch.zeros(B, Hkv, Me, Dh, device=device, dtype=dtype),
-                'exact_sum_v': torch.zeros(B, Hkv, Me, Dh, device=device, dtype=dtype),
-                'exact_upd': torch.zeros(B, Me, device=device, dtype=dtype),
-                'exact_max_score': torch.empty(B, Me, device=device, dtype=torch.float32),
-                'exact_max_pos': torch.empty(B, Me, device=device, dtype=torch.int64),
-                'exact_pos_slot': torch.zeros(B, Me, device=device, dtype=torch.int64),
-                'sum_count': torch.zeros(B, Ms, device=device, dtype=dtype),
-                'sum_sum_k': torch.zeros(B, Hkv, Ms, Dh, device=device, dtype=dtype),
-                'sum_sum_v': torch.zeros(B, Hkv, Ms, Dh, device=device, dtype=dtype),
-            }
+            self._scratch[key] = self._new_scratch(B, Hkv, self.Me, self.Ms, Dh, device, dtype)
         return self._scratch[key]
 
     # ------------------------------------------------------------------
@@ -399,6 +412,16 @@ class MemoryBankMixin:
         k_old, v_old, g_old = self._get_recent_time_order(state)
         Lr = int(k_old.size(2))
 
+        # When gradients flow through evicted tokens (detach_evicted=False),
+        # clone state buffers so subsequent in-place writes (bank updates,
+        # ring buffer zero/fill) don't invalidate tensors saved by autograd
+        # during the SDPA computation above.  k_old/v_old/g_old already
+        # reference the originals; writes will go to the clones only.
+        if not self.detach_evicted:
+            state.k_buf = state.k_buf.clone()
+            state.v_buf = state.v_buf.clone()
+            state.g_recent = state.g_recent.clone()
+
         k_cat = torch.cat([k_old, k_blk], dim=2)
         v_cat = torch.cat([v_old, v_blk], dim=2)
         g_cat = torch.cat([g_old, g_blk.to(device=k_blk.device, dtype=torch.float32)], dim=1)
@@ -534,6 +557,13 @@ class MemoryBankMixin:
         sc = self._get_scratch(B, Hkv, Dh, device, k_sel.dtype)
 
         mem_k, mem_v, used = self._view_exact(state)
+        # Clone views when gradients flow through bank updates: the
+        # write-back (state.k_buf[:, :, s:e, :] = ...) increments the base
+        # tensor's version, invalidating autograd-saved references to these
+        # views.  Cloning makes them independent tensors.
+        if not self.detach_evicted:
+            mem_k = mem_k.clone()
+            mem_v = mem_v.clone()
         last = state.mem_last_exact
 
         if self.write_policy != "none":
@@ -679,6 +709,9 @@ class MemoryBankMixin:
         sc = self._get_scratch(B, Hkv, Dh, device, k_sel.dtype)
 
         mem_k, mem_v, used = self._view_sum(state)
+        if not self.detach_evicted:
+            mem_k = mem_k.clone()
+            mem_v = mem_v.clone()
 
         # LF-K routing: cosine similarity on low-frequency key band.
         lf = self.lf_start

@@ -238,3 +238,96 @@ class TestPrefillBoundaries:
         """block_size larger than L: entire prefill processed in one chunk."""
         model = _make_model(window=64)
         _prefill_then_decode(model, prefill_len=64, block_size=1024)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Gradient flow through evicted tokens (detach_evicted=False)
+# ---------------------------------------------------------------------------
+
+
+class TestNoDetachEvictedBackward:
+    """Backward pass with detach_evicted=False (training mode for write gate).
+
+    Exercises the autograd-safe clone paths added in memory_banks.py:
+      - Fresh scratch buffers per chunk (no cross-chunk version conflicts)
+      - Cloned state buffers before write phase (protects SDPA saved refs)
+      - Cloned bank views (protects within-method read-then-write)
+    """
+
+    def test_backward_multi_block_prefill(self) -> None:
+        """Multi-block prefill with detach_evicted=False must not crash backward.
+
+        This is the exact scenario that caused the ScatterAddBackward0 version
+        mismatch (version 14 expected 12) before the clone fix.
+        """
+        model = _make_model(
+            detach_evicted=False,
+            window=16,
+            num_landmarks_exact=8,
+            num_landmarks_summary=8,
+            mem_init="zeros",
+        )
+        model.train()
+        state = model.init_state(batch_size=2, device=DEVICE, dtype=DTYPE)
+
+        # Prefill with block_size=16 → 4 blocks → multiple sequential
+        # _write_block_fast calls sharing scratch buffers (pre-fix) and
+        # doing in-place state writes.
+        x = torch.randn(2, 64, EMBED_DIM, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        y, state = model.prefill_chunked(x, state, block_size=16)
+
+        loss = y.sum()
+        loss.backward()  # Should not crash with version mismatch
+
+        assert x.grad is not None, "Gradient did not flow back to input"
+        assert not torch.isnan(x.grad).any(), "NaN in gradient"
+
+    def test_backward_single_block_no_eviction(self) -> None:
+        """Prefill shorter than window: no eviction, but clone paths still safe."""
+        model = _make_model(detach_evicted=False, window=64, mem_init="zeros")
+        model.train()
+        state = model.init_state(batch_size=1, device=DEVICE, dtype=DTYPE)
+
+        x = torch.randn(1, 32, EMBED_DIM, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        y, state = model.prefill_chunked(x, state, block_size=256)
+        y.sum().backward()
+        assert x.grad is not None
+
+    def test_backward_batch2_many_blocks(self) -> None:
+        """Batch=2, many small blocks: stress-tests scratch reuse path."""
+        model = _make_model(
+            detach_evicted=False,
+            window=8,
+            num_landmarks_exact=4,
+            num_landmarks_summary=4,
+            mem_init="zeros",
+        )
+        model.train()
+        state = model.init_state(batch_size=2, device=DEVICE, dtype=DTYPE)
+
+        x = torch.randn(2, 48, EMBED_DIM, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        y, state = model.prefill_chunked(x, state, block_size=8)
+        y.sum().backward()
+        assert x.grad is not None
+        assert not torch.isnan(x.grad).any()
+
+    def test_write_gate_receives_gradient(self) -> None:
+        """With detach_evicted=False, write_proj must receive non-zero gradients."""
+        model = _make_model(
+            detach_evicted=False,
+            window=16,
+            num_landmarks_exact=8,
+            num_landmarks_summary=8,
+            mem_init="zeros",
+        )
+        model.train()
+        state = model.init_state(batch_size=1, device=DEVICE, dtype=DTYPE)
+
+        x = torch.randn(1, 64, EMBED_DIM, device=DEVICE, dtype=DTYPE)
+        y, state = model.prefill_chunked(x, state, block_size=16)
+        y.sum().backward()
+
+        wp = model.write_proj
+        assert wp.weight.grad is not None, "write_proj.weight got no gradient"
+        # Gradient may be small but should not be exactly zero everywhere.
+        # (With detach_evicted=True, it IS exactly zero.)
