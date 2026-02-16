@@ -48,6 +48,12 @@ class CoDAGQA(nn.Module):
         lambda_init_bias: float = -6.0,
         theta_init: float = math.pi / 2,
         eps: float = 1e-6,
+        # WARNING: These defaults (rope_interleaved=True, head_norm_mode="full")
+        # differ from LlamaCoDAAdapter (rope_interleaved=False, head_norm_mode=
+        # "identity"). When transferring weights between bare CoDAGQA and
+        # LlamaCoDAAdapter, ensure settings match to avoid silent numerical
+        # divergence. Llama-family models use non-interleaved (contiguous-half)
+        # RoPE and identity head norm for cold-swap evaluation.
         head_norm_mode: str = "full",
         rope_interleaved: bool = True,
     ):

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -51,8 +52,16 @@ class LlamaCoDAAdapter(nn.Module):
         lambda_init_bias: float = -6.0,
         theta_init: float = math.pi / 2,
         eps: float = 1e-6,
-        head_norm_mode: str = "identity",  # default to identity for cold-swap
-        rope_interleaved: bool = False,  # Llama uses contiguous-half convention
+        # WARNING: These defaults (rope_interleaved=False, head_norm_mode=
+        # "identity") differ from bare CoDAGQA and CoDAGQALandmarkPerf2
+        # (rope_interleaved=True, head_norm_mode="full"). When transferring
+        # weights trained with bare CoDAGQA into LlamaCoDAAdapter, you MUST
+        # explicitly pass rope_interleaved and head_norm_mode to match the
+        # training configuration, otherwise outputs will silently diverge.
+        # These Llama-specific defaults are correct for cold-swap evaluation
+        # of Llama-family models (contiguous-half RoPE, no HeadwiseRMSNorm).
+        head_norm_mode: str = "identity",
+        rope_interleaved: bool = False,
         # Bounded-mode parameters
         window: int = 256,
         num_landmarks_exact: int = 64,
@@ -110,6 +119,7 @@ class LlamaCoDAAdapter(nn.Module):
         llama_attn: nn.Module,
         bounded: bool = False,
         head_norm_mode: str = "identity",
+        rope_interleaved: bool = False,
         **coda_kwargs,
     ) -> "LlamaCoDAAdapter":
         """Create adapter by copying weights from a Llama-family attention module.
@@ -117,12 +127,27 @@ class LlamaCoDAAdapter(nn.Module):
         Llama uses separate Q/K/V/O projections, so the weight mapping is 1:1.
         Supports GQA (num_kv_heads < num_heads).
 
+        .. warning::
+
+            The defaults here (``rope_interleaved=False``,
+            ``head_norm_mode="identity"``) are tuned for Llama-family models
+            and differ from ``CoDAGQA`` / ``CoDAGQALandmarkPerf2`` defaults
+            (``rope_interleaved=True``, ``head_norm_mode="full"``).  If you
+            trained with bare ``CoDAGQA()`` using its defaults, you **must**
+            pass ``rope_interleaved=True`` and ``head_norm_mode="full"`` here
+            to match, otherwise outputs will silently diverge.
+
         Args:
             llama_attn: A Llama-style attention module with q_proj, k_proj,
                 v_proj, o_proj attributes.
             bounded: Whether to use bounded-memory inference mode.
             head_norm_mode: "identity" for cold-swap (default), "full" for
                 HeadwiseRMSNorm (requires training).
+            rope_interleaved: RoPE dimension pairing convention.  False
+                (default) uses the contiguous-half layout native to Llama
+                models: pairs are (i, i + D/2).  True uses the interleaved
+                layout: pairs are (2i, 2i+1).  Must match the convention
+                used during training.
             **coda_kwargs: Forwarded to the constructor (window, etc.).
         """
         # Extract dimensions from the attention module.
@@ -157,6 +182,35 @@ class LlamaCoDAAdapter(nn.Module):
         if config is not None:
             rope_theta = getattr(config, "rope_theta", rope_theta)
 
+        # Emit a warning when the chosen settings differ from CoDAGQA /
+        # CoDAGQALandmarkPerf2 defaults, which is the most common source of
+        # silent numerical divergence when transferring weights.
+        _CODA_DEFAULT_ROPE_INTERLEAVED = True
+        _CODA_DEFAULT_HEAD_NORM_MODE = "full"
+        mismatches = []
+        if rope_interleaved != _CODA_DEFAULT_ROPE_INTERLEAVED:
+            mismatches.append(
+                f"rope_interleaved={rope_interleaved} (CoDAGQA default: "
+                f"{_CODA_DEFAULT_ROPE_INTERLEAVED})"
+            )
+        if head_norm_mode != _CODA_DEFAULT_HEAD_NORM_MODE:
+            mismatches.append(
+                f"head_norm_mode={head_norm_mode!r} (CoDAGQA default: "
+                f"{_CODA_DEFAULT_HEAD_NORM_MODE!r})"
+            )
+        if mismatches:
+            warnings.warn(
+                "LlamaCoDAAdapter.from_llama_attention: settings differ from "
+                "CoDAGQA / CoDAGQALandmarkPerf2 defaults -- "
+                + "; ".join(mismatches)
+                + ". If you trained with bare CoDAGQA() using its defaults, "
+                "pass rope_interleaved=True and head_norm_mode='full' to "
+                "from_llama_attention() to match. Mismatched settings will "
+                "produce silently wrong outputs (e.g. max_diff >> 0).",
+                UserWarning,
+                stacklevel=2,
+            )
+
         adapter = cls(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -165,6 +219,7 @@ class LlamaCoDAAdapter(nn.Module):
             bounded=bounded,
             rope_theta=rope_theta,
             head_norm_mode=head_norm_mode,
+            rope_interleaved=rope_interleaved,
             **coda_kwargs,
         )
 

@@ -89,6 +89,12 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         # Metrics
         collect_metrics: bool = False,
         # Head norm mode: "full" = HeadwiseRMSNorm (default), "identity" = bypass
+        # WARNING: These defaults (rope_interleaved=True, head_norm_mode="full")
+        # differ from LlamaCoDAAdapter (rope_interleaved=False, head_norm_mode=
+        # "identity"). When transferring weights between standalone usage and
+        # LlamaCoDAAdapter, ensure settings match to avoid silent numerical
+        # divergence. Llama-family models use non-interleaved (contiguous-half)
+        # RoPE and identity head norm for cold-swap evaluation.
         head_norm_mode: str = "full",
         # RoPE dimension pairing: True = interleaved (0,1),(2,3),...
         # False = contiguous halves (0,D/2),(1,D/2+1),... (Llama convention)
@@ -469,6 +475,8 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
             # which is WRONG when Lq < Lk (prefix-LM pattern). We need all
             # queries to see the full prefix plus causal within the block,
             # so we always construct an explicit mask when there is a prefix.
+            #
+            # SDPA bool mask: True = keep/participate, False = mask out (-inf).
             Lk_total = k_all.size(2)
             if Lk_total == blk:
                 # No prefix → square attention → is_causal=True is correct.

@@ -1,28 +1,37 @@
 """Fine-tune a Llama-family model with CoDA-GQA-L attention.
 
-Continued pretraining teaches the model to use CoDA's differential attention
-(lambda, theta, head_norm) effectively. After training, the script evaluates
-with bounded KV cache to measure quality retention under memory compression.
+Two-phase training:
+  Phase 1 (unbounded): Teaches the model to use CoDA's differential attention
+    (lambda, theta, head_norm) with full KV context.
+  Phase 2 (bounded, optional): Switches to bounded KV cache so the model
+    learns to work within O(W+Me+Ms) memory. This is where the write gate,
+    memory banks, and EMA parameters actually get used.
 
 Training flow:
   1. Load pre-trained model, swap attention layers to CoDA-GQA (unbounded)
   2. Freeze non-attention params (configurable)
-  3. Train with next-token prediction on WikiText-103 (or custom data)
-  4. Evaluate: unbounded PPL (should stay near baseline)
-  5. Evaluate: bounded PPL (the key metric — does bounded cache retain quality?)
+  3. Phase 1: Train unbounded with next-token prediction
+  4. Phase 2: Switch to bounded, continue training (model adapts to limited context)
+  5. Evaluate: unbounded PPL + bounded PPL
 
 Usage:
     # Quick test on SmolLM2-135M (~5 min on GPU)
     python benchmarks/train_coda.py --model HuggingFaceTB/SmolLM2-135M \
         --max-steps 200 --eval-every 100
 
-    # Mistral 7B on H100 (~4 hours)
-    python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 \
-        --max-steps 2000 --batch-size 2 --grad-accum 4
+    # With Phase 2 bounded training (the key experiment)
+    python benchmarks/train_coda.py --model HuggingFaceTB/SmolLM2-135M \
+        --max-steps 200 --bounded-steps 100 --bounded-config medium
 
-    # Llama 3.1 8B on H100 (~8 hours)
+    # Mistral 7B on H100 (~6 hours with Phase 2)
+    python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 \
+        --max-steps 2000 --bounded-steps 1000 --bounded-config medium \
+        --batch-size 2 --grad-accum 4
+
+    # Llama 3.1 8B (full pipeline)
     python benchmarks/train_coda.py --model meta-llama/Llama-3.1-8B \
-        --max-steps 5000 --batch-size 1 --grad-accum 8
+        --max-steps 3000 --bounded-steps 2000 --bounded-config large \
+        --batch-size 1 --grad-accum 8
 
     # Train CoDA params only (fastest, smallest memory)
     python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 \
@@ -141,8 +150,13 @@ def swap_attention(
     model: nn.Module,
     head_norm_mode: str = "identity",
     theta_init: float = 0.0,
+    bounded: bool = False,
+    window: int = 256,
+    num_landmarks_exact: int = 64,
+    num_landmarks_summary: int = 64,
+    block_size: int = 256,
 ) -> Tuple[nn.Module, List[LlamaCoDAAdapter]]:
-    """Replace Llama-family attention with unbounded CoDA adapters.
+    """Replace Llama-family attention with CoDA adapters.
 
     Default initialization is near-identity so the model starts close to its
     pre-trained PPL and the differential mechanism "wakes up" gradually:
@@ -165,10 +179,14 @@ def swap_attention(
         attn = block.self_attn
         adapter = LlamaCoDAAdapter.from_llama_attention(
             attn,
-            bounded=False,
+            bounded=bounded,
             head_norm_mode=head_norm_mode,
             theta_init=theta_init,
             rope_interleaved=False,  # Llama convention
+            window=window,
+            num_landmarks_exact=num_landmarks_exact,
+            num_landmarks_summary=num_landmarks_summary,
+            block_size=block_size,
         )
         device = next(attn.parameters()).device
         dtype = next(attn.parameters()).dtype
@@ -176,9 +194,85 @@ def swap_attention(
         block.self_attn = adapter
         adapters.append(adapter)
 
+    mode = "bounded" if bounded else "unbounded"
     print(f"  Swapped {len(adapters)}/{len(blocks)} attention layers "
-          f"(theta={theta_init:.2f}, head_norm={head_norm_mode})")
+          f"({mode}, theta={theta_init:.2f}, head_norm={head_norm_mode})")
+    if bounded:
+        print(f"  Bounded config: W={window}, Me={num_landmarks_exact}, "
+              f"Ms={num_landmarks_summary}, block_size={block_size}")
     return model, adapters
+
+
+def switch_to_bounded(
+    model: nn.Module,
+    adapters_ub: List[LlamaCoDAAdapter],
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    window: int = 256,
+    num_landmarks_exact: int = 64,
+    num_landmarks_summary: int = 64,
+    block_size: int = 256,
+) -> Tuple[nn.Module, List[LlamaCoDAAdapter]]:
+    """Switch unbounded adapters to bounded, copying all trained weights.
+
+    Creates new bounded LlamaCoDAAdapters, copies shared weights (Q/K/V/O
+    projections, lambda_proj, theta, head_norm) from the unbounded adapters.
+    Bounded-only params (write_proj, summary_eta_logit) start at their defaults.
+
+    Returns (model, bounded_adapters).
+    """
+    blocks = model.model.layers
+    adapters_b: List[LlamaCoDAAdapter] = []
+
+    for i, (block, adapter_ub) in enumerate(zip(blocks, adapters_ub)):
+        coda_ub = adapter_ub.coda
+
+        adapter_b = LlamaCoDAAdapter(
+            hidden_size=adapter_ub.hidden_size,
+            num_heads=adapter_ub.num_heads,
+            num_kv_heads=adapter_ub.num_kv_heads,
+            head_dim=adapter_ub.head_dim,
+            bounded=True,
+            rope_theta=10_000.0,
+            head_norm_mode=coda_ub.head_norm_mode,
+            rope_interleaved=coda_ub.rope_interleaved,
+            window=window,
+            num_landmarks_exact=num_landmarks_exact,
+            num_landmarks_summary=num_landmarks_summary,
+            block_size=block_size,
+        )
+        adapter_b = adapter_b.to(device=device, dtype=dtype)
+        coda_b = adapter_b.coda
+
+        # Transfer shared weights.
+        with torch.no_grad():
+            coda_b.q_proj.load_state_dict(coda_ub.q_proj.state_dict())
+            coda_b.k_proj.load_state_dict(coda_ub.k_proj.state_dict())
+            coda_b.v_proj.load_state_dict(coda_ub.v_proj.state_dict())
+            coda_b.o_proj.load_state_dict(coda_ub.o_proj.state_dict())
+            coda_b.lambda_proj.load_state_dict(coda_ub.lambda_proj.state_dict())
+            coda_b.theta.copy_(coda_ub.theta)
+            if (
+                hasattr(coda_b, "head_norm")
+                and hasattr(coda_ub, "head_norm")
+                and not isinstance(coda_ub.head_norm, nn.Identity)
+            ):
+                coda_b.head_norm.load_state_dict(coda_ub.head_norm.state_dict())
+
+        block.self_attn = adapter_b
+        adapters_b.append(adapter_b)
+
+    print(f"  Switched {len(adapters_b)} layers: unbounded -> bounded")
+    print(f"  Config: W={window}, Me={num_landmarks_exact}, "
+          f"Ms={num_landmarks_summary}, block_size={block_size}")
+    return model, adapters_b
+
+
+def reset_adapter_states(adapters: List[LlamaCoDAAdapter]) -> None:
+    """Reset inference state for all bounded adapters (call per training batch)."""
+    for a in adapters:
+        a.reset_state()
 
 
 def freeze_params(
@@ -495,8 +589,16 @@ def train(
     optimizer.zero_grad()
     print_every = max(grad_accum * 5, grad_accum)
 
+    # Detect if we're in bounded training mode (adapters have bounded=True).
+    is_bounded_training = adapters and adapters[0].bounded
+
     for step in range(1, max_steps + 1):
         input_ids = get_batch()
+
+        # In bounded mode, reset state before each forward pass so each
+        # training sequence starts with a fresh KV buffer.
+        if is_bounded_training:
+            reset_adapter_states(adapters)
 
         # Forward + loss.
         with torch.amp.autocast(
@@ -618,20 +720,22 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Quick test
+  # Quick test (unbounded only)
   python benchmarks/train_coda.py --model HuggingFaceTB/SmolLM2-135M --max-steps 200
 
-  # Mistral 7B on H100
+  # With Phase 2 bounded training (the key experiment)
+  python benchmarks/train_coda.py --model HuggingFaceTB/SmolLM2-135M \\
+      --max-steps 200 --bounded-steps 100 --bounded-config medium
+
+  # Mistral 7B full pipeline on H100
   python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 \\
-      --max-steps 2000 --batch-size 2 --grad-accum 4
+      --max-steps 2000 --bounded-steps 1000 --bounded-config medium \\
+      --batch-size 2 --grad-accum 4
 
   # Llama 3.1 8B (memory-constrained)
   python benchmarks/train_coda.py --model meta-llama/Llama-3.1-8B \\
-      --max-steps 5000 --batch-size 1 --grad-accum 8
-
-  # CoDA params only (fastest, minimal memory)
-  python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 \\
-      --freeze coda-only --lr-coda 1e-3
+      --max-steps 3000 --bounded-steps 2000 --bounded-config large \\
+      --batch-size 1 --grad-accum 8
 """,
     )
     # Model & data.
@@ -676,6 +780,20 @@ Examples:
     p.add_argument("--theta-init", type=float, default=0.0,
                     help="Initial theta for pairwise rotation (0 = identity, pi/2 = orthogonal).")
 
+    # Phase 2: Bounded training.
+    p.add_argument("--bounded-steps", type=int, default=0,
+                    help="Number of Phase 2 bounded training steps (0 = skip). "
+                         "After Phase 1 unbounded training completes, switches to "
+                         "bounded attention and continues training so the model "
+                         "learns to work within the bounded KV cache.")
+    p.add_argument("--bounded-config", type=str, default="medium",
+                    choices=list(BOUNDED_CONFIGS.keys()),
+                    help="Bounded cache config for Phase 2 training.")
+    p.add_argument("--bounded-lr-scale", type=float, default=0.1,
+                    help="LR scale factor for Phase 2 (relative to Phase 1 final LR).")
+    p.add_argument("--bounded-block-size", type=int, default=256,
+                    help="Block size for bounded prefill during training.")
+
     # Hardware.
     p.add_argument("--dtype", type=str, default="bf16",
                     choices=["bf16", "fp32"])
@@ -709,7 +827,11 @@ def main() -> None:
     print("=" * 60)
     print(f"  Model:     {args.model}")
     print(f"  Device:    {device}, dtype: {dtype}")
-    print(f"  Steps:     {args.max_steps}")
+    print(f"  Phase 1:   {args.max_steps} steps (unbounded)")
+    if args.bounded_steps > 0:
+        bcfg = BOUNDED_CONFIGS[args.bounded_config]
+        print(f"  Phase 2:   {args.bounded_steps} steps (bounded, "
+              f"W={bcfg['window']}, Me={bcfg['Me']}, Ms={bcfg['Ms']})")
     print(f"  Batch:     {args.batch_size} x {args.grad_accum} accum x {args.seq_len} seq")
     print(f"  Eff batch: {eff_batch:,} tokens/update")
     print(f"  Freeze:    {args.freeze}")
@@ -774,8 +896,8 @@ def main() -> None:
         json.dumps(config, indent=2, default=str), encoding="utf-8",
     )
 
-    # --- Train ---
-    print(f"\n--- Training ---")
+    # --- Phase 1: Unbounded Training ---
+    print(f"\n--- Phase 1: Unbounded Training ({args.max_steps} steps) ---")
     log = train(
         model, adapters, optimizer, train_chunks, eval_tokens,
         device, dtype,
@@ -790,6 +912,79 @@ def main() -> None:
         eval_bounded=not args.no_eval_bounded,
         eval_bounded_tokens=args.eval_bounded_tokens,
     )
+
+    # --- Phase 2: Bounded Training ---
+    if args.bounded_steps > 0:
+        bcfg = BOUNDED_CONFIGS[args.bounded_config]
+        print(f"\n--- Phase 2: Bounded Training ({args.bounded_steps} steps) ---")
+        print(f"  Switching to bounded attention...")
+
+        # Save Phase 1 checkpoint before switching.
+        save_checkpoint(adapters, output_dir / "phase1_final", args.max_steps, log)
+
+        # Switch all adapters from unbounded to bounded.
+        model, adapters_b = switch_to_bounded(
+            model, adapters, device, dtype,
+            window=bcfg["window"],
+            num_landmarks_exact=bcfg["Me"],
+            num_landmarks_summary=bcfg["Ms"],
+            block_size=args.bounded_block_size,
+        )
+
+        # Gradient checkpointing on the new adapters.
+        if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
+            model.config.use_cache = False
+
+        # Set up optimizer for Phase 2: all adapter params trainable,
+        # with lower LR to avoid catastrophic forgetting.
+        print(f"\n--- Phase 2 Optimizer ---")
+        freeze_params(model, adapters_b, args.freeze)
+        lr_p2 = args.lr * args.bounded_lr_scale
+        lr_coda_p2 = args.lr_coda * args.bounded_lr_scale
+        optimizer_p2 = setup_optimizer(
+            model, adapters_b, lr_p2, lr_coda_p2, args.weight_decay,
+        )
+
+        # Phase 2 eval before training (bounded PPL baseline).
+        if eval_tokens is not None:
+            ppl_p2_start = eval_bounded_ppl(
+                model, adapters_b, eval_tokens, device, dtype,
+                max_tokens=args.eval_bounded_tokens,
+            )
+            print(f"  Phase 2 start bounded PPL: {ppl_p2_start:.2f}")
+            log.append({
+                "step": args.max_steps,
+                "phase": 2,
+                "bounded_ppl_start": round(ppl_p2_start, 2),
+            })
+
+        log_p2 = train(
+            model, adapters_b, optimizer_p2, train_chunks, eval_tokens,
+            device, dtype,
+            max_steps=args.bounded_steps,
+            batch_size=args.batch_size,
+            grad_accum=args.grad_accum,
+            seq_len=args.seq_len,
+            warmup_steps=min(50, args.bounded_steps // 10),
+            eval_every=args.eval_every,
+            save_every=args.save_every,
+            output_dir=output_dir / "phase2",
+            eval_bounded=True,
+            eval_bounded_tokens=args.eval_bounded_tokens,
+        )
+
+        # Merge logs with phase annotation.
+        for entry in log_p2:
+            entry["phase"] = 2
+            if "step" in entry:
+                entry["step"] += args.max_steps  # offset for total step count
+        log.extend(log_p2)
+
+        # Use bounded adapters for final summary.
+        adapters = adapters_b
 
     # --- Summary ---
     print(f"\n{'=' * 60}")
@@ -807,6 +1002,8 @@ def main() -> None:
         print(f"  Eval PPL:   {ppls[0]:.2f} -> {ppls[-1]:.2f}")
     if bounded:
         print(f"  Bounded PPL: {bounded[-1]['bounded_ppl']:.2f}")
+    if args.bounded_steps > 0:
+        print(f"  Phase 2:     {args.bounded_steps} steps ({args.bounded_config})")
 
 
 if __name__ == "__main__":

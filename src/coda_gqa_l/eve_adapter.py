@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -56,6 +57,12 @@ class EveCoDAAdapter(nn.Module):
         lambda_init_bias: float = -6.0,
         theta_init: float = math.pi / 2,
         eps: float = 1e-6,
+        # NOTE: These defaults (rope_interleaved=True, head_norm_mode="full")
+        # match CoDAGQA and CoDAGQALandmarkPerf2 defaults.  They differ from
+        # LlamaCoDAAdapter (rope_interleaved=False, head_norm_mode="identity").
+        # Eve-2 uses complex-valued RoPE equivalent to interleaved real-valued
+        # RoPE, so interleaved=True is correct for Eve models.  If transferring
+        # weights to/from LlamaCoDAAdapter, ensure settings match.
         head_norm_mode: str = "full",
         rope_interleaved: bool = True,
         # Bounded-mode parameters (ignored when bounded=False)
@@ -140,6 +147,8 @@ class EveCoDAAdapter(nn.Module):
         cls,
         eve_attn: nn.Module,
         bounded: bool = False,
+        head_norm_mode: str = "full",
+        rope_interleaved: bool = True,
         **coda_kwargs,
     ) -> "EveCoDAAdapter":
         """Create an adapter by copying weights from an Eve CausalSelfAttention.
@@ -148,9 +157,26 @@ class EveCoDAAdapter(nn.Module):
         separate Q, K, V projections.  Biases are preserved by replacing
         CoDA's bias-free ``nn.Linear`` layers with bias-enabled versions.
 
+        .. note::
+
+            The defaults here (``rope_interleaved=True``,
+            ``head_norm_mode="full"``) match ``CoDAGQA`` /
+            ``CoDAGQALandmarkPerf2`` defaults.  Eve-2 uses complex-valued
+            RoPE equivalent to interleaved real-valued RoPE, so
+            ``rope_interleaved=True`` is correct for Eve models.  These
+            differ from ``LlamaCoDAAdapter`` defaults
+            (``rope_interleaved=False``, ``head_norm_mode="identity"``).
+
         Args:
             eve_attn: An instance of Eve-2's ``CausalSelfAttention``.
             bounded: Whether to use bounded-memory inference mode.
+            head_norm_mode: "full" for HeadwiseRMSNorm (default, matches
+                CoDAGQA), "identity" to bypass (for cold-swap evaluation
+                without retraining).
+            rope_interleaved: RoPE dimension pairing convention.  True
+                (default) uses the interleaved layout native to Eve-2:
+                pairs are (2i, 2i+1).  Must match the convention used
+                during training.
             **coda_kwargs: Forwarded to the ``EveCoDAAdapter`` constructor
                 (e.g. window, num_landmarks_exact, block_size, etc.).
 
@@ -166,6 +192,8 @@ class EveCoDAAdapter(nn.Module):
             n_head=n_head,
             head_dim=head_dim,
             bounded=bounded,
+            head_norm_mode=head_norm_mode,
+            rope_interleaved=rope_interleaved,
             **coda_kwargs,
         )
 
