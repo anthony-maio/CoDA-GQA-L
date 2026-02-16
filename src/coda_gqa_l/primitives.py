@@ -80,20 +80,37 @@ def _apply_pairwise_rotation(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tens
     return out
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Applies RoPE (position-dependent pairwise rotation) to x."""
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, interleaved: bool = True) -> torch.Tensor:
+    """Applies RoPE (position-dependent rotation) to x.
+
+    Args:
+        x: (B, H, L, Dh)
+        cos, sin: (L, Dh/2) frequency tables
+        interleaved: If True (default), pairs dims (0,1), (2,3), ...
+            (GPT-NeoX convention).  If False, pairs dims (0,D/2), (1,D/2+1), ...
+            (Llama/HuggingFace convention).
+    """
     B, H, L, Dh = x.shape
     half = Dh // 2
     cos = cos.view(1, 1, L, half)
     sin = sin.view(1, 1, L, half)
-    x_even = x[..., 0::2]
-    x_odd = x[..., 1::2]
-    out_even = x_even * cos - x_odd * sin
-    out_odd = x_even * sin + x_odd * cos
-    out = torch.empty_like(x)
-    out[..., 0::2] = out_even
-    out[..., 1::2] = out_odd
-    return out
+    if interleaved:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        out_even = x_even * cos - x_odd * sin
+        out_odd = x_even * sin + x_odd * cos
+        out = torch.empty_like(x)
+        out[..., 0::2] = out_even
+        out[..., 1::2] = out_odd
+        return out
+    else:
+        # Llama/HuggingFace convention: use the same op order as transformers'
+        # apply_rotary_pos_emb for bit-exact bf16 matching.
+        #   out = x * cos_full + rotate_half(x) * sin_full
+        cos_full = torch.cat([cos, cos], dim=-1)
+        sin_full = torch.cat([sin, sin], dim=-1)
+        x_rot = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+        return x * cos_full + x_rot * sin_full
 
 
 def repeat_kv(x: torch.Tensor, num_repeat: int) -> torch.Tensor:

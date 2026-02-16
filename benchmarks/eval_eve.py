@@ -486,21 +486,182 @@ def compute_perplexity(
 
 
 @torch.no_grad()
+def compute_perplexity_bounded(
+    model_orig: nn.Module,
+    tokenizer: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    window: int = 256,
+    Me: int = 64,
+    Ms: int = 64,
+    block_size: int = 256,
+    chunk_size: int = 512,
+    max_tokens: Optional[int] = None,
+) -> float:
+    """Compute perplexity with bounded CoDA attention (streaming).
+
+    Processes the entire input as a continuous stream, maintaining bounded
+    KV cache state across chunks.  Each chunk is fed through model.forward()
+    with bounded EveCoDAAdapters that persist their state automatically.
+
+    The adapter's _forward_bounded routes L>1 to prefill_chunked and L==1
+    to step, both maintaining state.  Eve's model.forward() applies
+    wte, block-by-block (ln_1->attn->ln_2->mlp), ln_f, and lm_head
+    normally; the adapter handles all KV state internally.
+
+    Args:
+        model_orig: The original Eve-2 model (will be deepcopied).
+        window: Recent window size for bounded cache.
+        Me: Exact landmark bank capacity.
+        Ms: Summary landmark bank capacity.
+        block_size: Prefill chunk size for bounded attention.
+        chunk_size: Number of tokens per streaming chunk.
+        max_tokens: Limit total tokens evaluated.
+
+    Returns:
+        Perplexity value.
+    """
+    # Build bounded model from a fresh copy.
+    model_bounded = copy.deepcopy(model_orig)
+
+    blocks = None
+    if hasattr(model_bounded, "transformer") and hasattr(model_bounded.transformer, "h"):
+        blocks = model_bounded.transformer.h
+    elif hasattr(model_bounded, "model") and hasattr(model_bounded.model, "transformer"):
+        blocks = model_bounded.model.transformer.h
+
+    if blocks is None:
+        raise RuntimeError("Could not locate transformer blocks.")
+
+    n_swapped = 0
+    adapters = []
+    for i, block in enumerate(blocks):
+        if hasattr(block, "attn"):
+            adapter = EveCoDAAdapter.from_eve_attention(
+                block.attn, bounded=True,
+                window=window, num_landmarks_exact=Me,
+                num_landmarks_summary=Ms, block_size=block_size,
+            )
+            adapter = adapter.to(device=device, dtype=dtype)
+            block.attn = adapter
+            adapters.append(adapter)
+            n_swapped += 1
+
+    total_slots = window + Me + Ms
+    cache_per_layer = adapters[0].cache_bytes(batch_size=1, dtype=dtype)
+    print(f"    Swapped {n_swapped} layers to bounded CoDA")
+    print(f"    Config: W={window}, Me={Me}, Ms={Ms} ({total_slots} slots/layer)")
+    print(f"    Cache: {human_bytes(cache_per_layer)}/layer, "
+          f"{human_bytes(cache_per_layer * n_swapped)} total")
+
+    # Load dataset.
+    print("    Loading WikiText-2...")
+    try:
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    except Exception as e:
+        print(f"    ERROR: Failed to load WikiText-2: {e}")
+        return float("nan")
+
+    text = "\n\n".join([t for t in dataset["text"] if t.strip()])
+    encodings = tokenizer(text, return_tensors="pt")
+    input_ids = encodings.input_ids.to(device)
+
+    seq_len = input_ids.size(1)
+    if max_tokens is not None:
+        seq_len = min(seq_len, max_tokens)
+        input_ids = input_ids[:, :seq_len]
+
+    print(f"    Total tokens: {seq_len:,}")
+
+    # Process as a continuous stream, maintaining state across chunks.
+    nlls: List[torch.Tensor] = []
+    n_tokens = 0
+    n_chunks = 0
+
+    for start in range(0, seq_len - 1, chunk_size):
+        end = min(start + chunk_size + 1, seq_len)  # +1 for target overlap
+        chunk = input_ids[:, start:end]
+        actual_len = chunk.size(1)
+
+        logits = get_model_logits(model_bounded, chunk)
+
+        # Shift for causal LM.
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = chunk[:, 1:].contiguous()
+
+        loss_fct = nn.CrossEntropyLoss(reduction="none")
+        token_losses = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+
+        # For overlapping chunks (start > 0), the first token overlaps
+        # with the last token of the previous chunk.  Skip it to avoid
+        # double-counting.
+        if start > 0:
+            token_losses = token_losses[1:]
+
+        nlls.append(token_losses.sum())
+        n_tokens += token_losses.numel()
+        n_chunks += 1
+
+        if n_chunks % 20 == 0:
+            running_ppl = torch.exp(torch.stack(nlls).sum() / n_tokens).item()
+            print(f"      Chunk {n_chunks}: {n_tokens:,} tokens, PPL={running_ppl:.2f}")
+
+        if end >= seq_len:
+            break
+
+    total_nll = torch.stack(nlls).sum()
+    ppl = torch.exp(total_nll / n_tokens).item()
+    print(f"    Final: {n_tokens:,} tokens, {n_chunks} chunks, PPL={ppl:.2f}")
+
+    # Report Phase-Safe invariant from layer 0.
+    if adapters:
+        st = adapters[0].get_state()
+        if st is not None:
+            lf = adapters[0].coda.lf_start
+            s_off = window + Me
+            hf_max = st.k_buf[:, :, s_off:, :lf].abs().max().item()
+            print(f"    Layer 0 Phase-Safe: HF max abs = {hf_max:.8f} "
+                  f"{'OK' if hf_max < 1e-6 else 'VIOLATION'}")
+
+    del model_bounded
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return ppl
+
+
+# Bounded configs to sweep in perplexity evaluation.
+BOUNDED_CONFIGS = {
+    "tiny": {"window": 128, "Me": 32, "Ms": 32},
+    "medium": {"window": 256, "Me": 64, "Ms": 64},
+    "large": {"window": 512, "Me": 128, "Ms": 128},
+    "window-only": {"window": 256, "Me": 0, "Ms": 0},
+}
+
+
+@torch.no_grad()
 def run_perplexity(
     model_name: str,
     device: torch.device,
     dtype: torch.dtype,
     no_swap: bool = False,
     max_tokens: Optional[int] = None,
+    bounded_configs: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run WikiText-2 perplexity evaluation.
 
     Compares:
     1. Original Eve model (baseline)
     2. Eve with CoDA-GQA-L unbounded (weight-swapped, no retraining)
+    3. Eve with CoDA-GQA-L bounded (streaming, no retraining)
 
-    Bounded mode evaluation is left as TODO -- it requires layer-by-layer
-    state management that cannot be done through the standard model.forward().
+    Bounded mode uses EveCoDAAdapter with automatic state management.
+    Each adapter persists its bounded KV cache across chunks, processing
+    the text as a continuous stream.
     """
     print("\n" + "=" * 60)
     print("Experiment: WikiText-2 Perplexity")
@@ -510,7 +671,7 @@ def run_perplexity(
     ppl_results: Dict[str, Any] = {}
 
     # --- Baseline perplexity ---
-    print("\n  [1/2] Baseline (original attention)")
+    print("\n  [1] Baseline (original attention)")
     ppl_baseline = compute_perplexity(
         model, tokenizer, device, dtype, max_tokens=max_tokens
     )
@@ -519,37 +680,57 @@ def run_perplexity(
 
     if not no_swap:
         # --- CoDA-GQA unbounded perplexity ---
-        print("\n  [2/2] CoDA-GQA unbounded (weight-swapped, no retraining)")
-        swap_attention_layers(model, bounded=False)
+        print("\n  [2] CoDA-GQA unbounded (weight-swapped, no retraining)")
+        model_ub = copy.deepcopy(model)
+        swap_attention_layers(model_ub, bounded=False)
         ppl_coda = compute_perplexity(
-            model, tokenizer, device, dtype, max_tokens=max_tokens
+            model_ub, tokenizer, device, dtype, max_tokens=max_tokens
         )
         ppl_results["coda_unbounded"] = ppl_coda
         print(f"  CoDA unbounded PPL: {ppl_coda:.2f}")
+        del model_ub
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-        if ppl_baseline > 0 and not (ppl_baseline != ppl_baseline):  # not NaN
+        if ppl_baseline > 0 and not (ppl_baseline != ppl_baseline):
             diff_pct = ((ppl_coda - ppl_baseline) / ppl_baseline) * 100
             print(f"  PPL change: {diff_pct:+.2f}%")
-            ppl_results["ppl_change_pct"] = diff_pct
+            ppl_results["unbounded_change_pct"] = diff_pct
 
-        # TODO: Bounded mode perplexity evaluation.
-        # This requires processing the input through the model layer by layer,
-        # managing CoDAGQALandmarkStatePerf2 per-layer state, which cannot be
-        # done through the standard model.forward() call.  A custom inference
-        # loop would be needed:
-        #
-        # for layer_idx, block in enumerate(blocks):
-        #     x = block.ln_1(x)
-        #     adapter = block.attn  # EveCoDAAdapter (bounded=True)
-        #     adapter.init_inference_state(...)
-        #     x_attn = adapter(x, freqs_cis=None)
-        #     x = x + x_attn
-        #     x = x + block.mlp(block.ln_2(x))
-        #
-        # This is left for future implementation.
-        ppl_results["coda_bounded"] = "TODO: requires custom layer-by-layer inference loop"
+        # --- CoDA-GQA bounded perplexity (streaming) ---
+        configs_to_run = bounded_configs or list(BOUNDED_CONFIGS.keys())
+        ppl_results["bounded"] = {}
+
+        step = 3
+        for cfg_name in configs_to_run:
+            if cfg_name not in BOUNDED_CONFIGS:
+                print(f"\n  [{step}] Unknown bounded config: {cfg_name}, skipping")
+                step += 1
+                continue
+
+            cfg = BOUNDED_CONFIGS[cfg_name]
+            print(f"\n  [{step}] CoDA-GQA bounded '{cfg_name}' "
+                  f"(W={cfg['window']}, Me={cfg['Me']}, Ms={cfg['Ms']})")
+
+            ppl_bounded = compute_perplexity_bounded(
+                model, tokenizer, device, dtype,
+                window=cfg["window"], Me=cfg["Me"], Ms=cfg["Ms"],
+                max_tokens=max_tokens,
+            )
+            ppl_results["bounded"][cfg_name] = {
+                "ppl": ppl_bounded,
+                "config": cfg,
+                "total_slots": cfg["window"] + cfg["Me"] + cfg["Ms"],
+            }
+
+            if ppl_baseline > 0 and not (ppl_baseline != ppl_baseline):
+                diff = ((ppl_bounded - ppl_baseline) / ppl_baseline) * 100
+                ppl_results["bounded"][cfg_name]["change_pct"] = diff
+                print(f"  '{cfg_name}' PPL change vs baseline: {diff:+.2f}%")
+
+            step += 1
     else:
-        print("\n  [2/2] Skipped (--no-swap)")
+        print("\n  [2+] Skipped (--no-swap)")
 
     results = {
         "experiment": "perplexity",
@@ -842,6 +1023,13 @@ Examples:
         help="Directory for JSON results (default: results/ at project root).",
     )
     parser.add_argument(
+        "--bounded-configs",
+        type=str,
+        default=None,
+        help="Comma-separated list of bounded configs to evaluate "
+             f"(default: all). Available: {', '.join(BOUNDED_CONFIGS.keys())}",
+    )
+    parser.add_argument(
         "--no-memory-table",
         action="store_true",
         help="Skip printing the KV cache memory comparison table.",
@@ -883,10 +1071,14 @@ def main() -> None:
             if exp == "forward-check":
                 result = run_forward_check(args.model, device, dtype)
             elif exp == "perplexity":
+                bc = None
+                if args.bounded_configs:
+                    bc = [c.strip() for c in args.bounded_configs.split(",")]
                 result = run_perplexity(
                     args.model, device, dtype,
                     no_swap=args.no_swap,
                     max_tokens=args.max_tokens,
+                    bounded_configs=bc,
                 )
             elif exp == "needle":
                 depths = None

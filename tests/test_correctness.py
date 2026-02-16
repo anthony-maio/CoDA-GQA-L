@@ -357,3 +357,68 @@ def test_summary_bank_hf_zero():
         f"Summary bank HF band should remain zero after Phase-Safe EMA, "
         f"got max abs = {hf_max}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 16. test_prefill_causal_mask_correctness
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_prefill_causal_mask_correctness():
+    """Prefill with a non-empty prefix uses prefix-causal attention, not
+    upper-left triangular.
+
+    Regression test for the is_causal=True upper-left alignment bug: PyTorch's
+    is_causal=True uses upper-left causal alignment for non-square attention,
+    where query i only sees keys 0..i.  Our prefill needs the prefix-causal
+    pattern where all queries see the FULL prefix plus causal within the block.
+
+    We verify this by checking that the first query token's output is
+    sensitive to ALL prefix keys, not just the first one.
+    """
+    import copy
+    B = 1
+    model = _make_model()
+
+    # Fill the cache with tokens so the prefix is non-empty.
+    torch.manual_seed(42)
+    state = model.init_state(batch_size=B, device=DEVICE, dtype=DTYPE)
+    x_fill = _rand_input(B, WINDOW)
+    _, state = model.prefill_chunked(
+        x_fill, state, block_size=WINDOW, write_cache=True, return_outputs=False,
+    )
+
+    # Run a second block through prefill (non-square: Lq=blk, Lk=prefix+blk).
+    torch.manual_seed(999)
+    blk_size = 32
+    x_blk = _rand_input(B, blk_size)
+    y_normal, _ = model.prefill_chunked(
+        x_blk, state, block_size=blk_size, write_cache=False, return_outputs=True,
+    )
+    assert y_normal is not None
+
+    # Now corrupt the LAST prefix key (farthest from query 0 in upper-left
+    # alignment, but fully visible in correct prefix-causal alignment).
+    state_corrupted = copy.deepcopy(state)
+    # Find valid slots and corrupt the last one.
+    valid = state_corrupted.allowed[0].nonzero(as_tuple=True)[0]
+    assert valid.numel() > 0, "should have valid prefix slots"
+    last_valid = valid[-1].item()
+    state_corrupted.k_buf[:, :, last_valid, :] += 100.0  # large perturbation
+
+    y_corrupted, _ = model.prefill_chunked(
+        x_blk, state_corrupted, block_size=blk_size, write_cache=False,
+        return_outputs=True,
+    )
+
+    # If the causal mask is correct (prefix-causal), query 0 sees the
+    # corrupted last prefix key, so y_corrupted[:, 0, :] should differ
+    # significantly from y_normal[:, 0, :].
+    diff_q0 = (y_normal[:, 0, :] - y_corrupted[:, 0, :]).abs().max().item()
+    assert diff_q0 > 0.01, (
+        f"Query 0 should be sensitive to ALL prefix keys, but corrupting "
+        f"the last prefix key only caused diff = {diff_q0:.6f}. "
+        f"This suggests query 0 cannot see the full prefix (upper-left "
+        f"causal alignment bug)."
+    )

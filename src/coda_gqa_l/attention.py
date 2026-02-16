@@ -88,6 +88,11 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         eps: float = 1e-6,
         # Metrics
         collect_metrics: bool = False,
+        # Head norm mode: "full" = HeadwiseRMSNorm (default), "identity" = bypass
+        head_norm_mode: str = "full",
+        # RoPE dimension pairing: True = interleaved (0,1),(2,3),...
+        # False = contiguous halves (0,D/2),(1,D/2+1),... (Llama convention)
+        rope_interleaved: bool = True,
     ):
         super().__init__()
         if embed_dim % num_heads != 0:
@@ -151,10 +156,17 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         self.mask_unused_memory = bool(mask_unused_memory)
         self.detach_evicted = bool(detach_evicted)
         self.collect_metrics = bool(collect_metrics)
+        self.rope_interleaved = bool(rope_interleaved)
 
         self.rope = RotaryEmbedding(self.head_dim, base=float(rope_base))
 
-        self.head_norm = HeadwiseRMSNorm(self.head_dim, eps=eps)
+        self.head_norm_mode = head_norm_mode
+        if head_norm_mode == "full":
+            self.head_norm = HeadwiseRMSNorm(self.head_dim, eps=eps)
+        elif head_norm_mode == "identity":
+            self.head_norm = nn.Identity()
+        else:
+            raise ValueError(f"head_norm_mode must be 'full' or 'identity', got {head_norm_mode!r}")
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=False)
 
         # Causal mask cache for chunked prefill: key = (Lprev_fixed, blk, device)
@@ -328,7 +340,7 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         q = self._project_q(x)
         q_pos = state.pos if query_pos is None else int(query_pos)
         cos, sin = self.rope(seq_len=1, offset=q_pos, device=device, dtype=dtype)
-        q = apply_rope(q, cos, sin)
+        q = apply_rope(q, cos, sin, interleaved=self.rope_interleaved)
 
         cos_t = torch.cos(self.theta).to(device=device, dtype=dtype)
         sin_t = torch.sin(self.theta).to(device=device, dtype=dtype)
@@ -358,7 +370,7 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         if attend and include_current_in_attention and write_cache:
             k_raw, v_new = self._project_kv_raw(x)
             cosk, sink = self.rope(seq_len=1, offset=q_pos, device=x.device, dtype=x.dtype)
-            k_new = apply_rope(k_raw, cosk, sink)
+            k_new = apply_rope(k_raw, cosk, sink, interleaved=self.rope_interleaved)
             g_new = self._write_gate(x)
             self._write_one(state, k_new=k_new, v_new=v_new, g_new=g_new)
             y = self.attend_step(x, state, query_pos=q_pos)
@@ -369,7 +381,7 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         if write_cache:
             k_raw, v_new = self._project_kv_raw(x)
             cosk, sink = self.rope(seq_len=1, offset=q_pos, device=x.device, dtype=x.dtype)
-            k_new = apply_rope(k_raw, cosk, sink)
+            k_new = apply_rope(k_raw, cosk, sink, interleaved=self.rope_interleaved)
             g_new = self._write_gate(x)
             self._write_one(state, k_new=k_new, v_new=v_new, g_new=g_new)
 
@@ -428,16 +440,12 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
             g_blk = self._write_gate(x_blk)
 
             cos_q, sin_q = self.rope(seq_len=blk, offset=pos0, device=device, dtype=dtype)
-            q = apply_rope(q, cos_q, sin_q)
+            q = apply_rope(q, cos_q, sin_q, interleaved=self.rope_interleaved)
             cos_k, sin_k = self.rope(seq_len=blk, offset=pos0, device=device, dtype=dtype)
-            k_blk = apply_rope(k_raw, cos_k, sin_k)
+            k_blk = apply_rope(k_raw, cos_k, sin_k, interleaved=self.rope_interleaved)
 
             # Dense packing: when B==1 and there are invalid prefix slots,
-            # pack only valid prefix slots → eliminates boolean mask →
-            # unlocks FlashAttention / MemEfficient SDPA backends.
-            # PyTorch SDPA with is_causal=True aligns the causal mask
-            # bottom-right when Lq < Lk, which is exactly what we need:
-            # all queries see the full packed prefix causally.
+            # pack only valid prefix slots to eliminate unnecessary keys.
             use_packing = (
                 B == 1
                 and self.mask_unused_memory
@@ -450,26 +458,37 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
                 v_prefix = v_prev[:, :, valid_idx, :]
                 k_all = torch.cat([k_prefix, k_blk], dim=2)
                 v_all = torch.cat([v_prefix, v_blk], dim=2)
-                attn_mask = None
-                is_causal = True
+                Lpacked = int(valid_idx.numel())
             else:
                 k_all = torch.cat([k_prev, k_blk], dim=2)
                 v_all = torch.cat([v_prev, v_blk], dim=2)
+                Lpacked = Lprev_fixed
 
-                if self.mask_unused_memory:
-                    block_ok = torch.ones((B, blk), device=device, dtype=torch.bool)
-                    allowed = torch.cat([allowed_prev, block_ok], dim=1)
+            # Build attention mask.
+            # NOTE: is_causal=True uses upper-left alignment in PyTorch (>=2.5),
+            # which is WRONG when Lq < Lk (prefix-LM pattern). We need all
+            # queries to see the full prefix plus causal within the block,
+            # so we always construct an explicit mask when there is a prefix.
+            Lk_total = k_all.size(2)
+            if Lk_total == blk:
+                # No prefix → square attention → is_causal=True is correct.
+                attn_mask = None
+                is_causal = True
+            else:
+                # Prefix + block → explicit prefix-causal mask.
+                causal = self._get_causal_mask(Lprev=Lk_total - blk, blk=blk, device=device)
+                if use_packing:
+                    # Packed: all remaining slots are valid, mask is just the causal pattern.
+                    attn_mask = causal.view(1, 1, blk, Lk_total)
+                    is_causal = False
                 else:
-                    allowed = torch.ones((B, Lprev_fixed + blk), device=device, dtype=torch.bool)
-
-                if bool(allowed.all()):
-                    # All slots valid → use is_causal=True, no mask needed.
-                    attn_mask = None
-                    is_causal = True
-                else:
-                    # Batched with gaps → fall back to explicit mask.
-                    causal = self._get_causal_mask(Lprev=Lprev_fixed, blk=blk, device=device)
-                    attn_mask = causal.view(1, 1, blk, Lprev_fixed + blk) & allowed[:, None, None, :]
+                    # Non-packed: also AND with allowed mask to hide invalid slots.
+                    if self.mask_unused_memory:
+                        block_ok = torch.ones((B, blk), device=device, dtype=torch.bool)
+                        allowed = torch.cat([allowed_prev, block_ok], dim=1)
+                    else:
+                        allowed = torch.ones((B, Lk_total), device=device, dtype=torch.bool)
+                    attn_mask = causal.view(1, 1, blk, Lk_total) & allowed[:, None, None, :]
                     is_causal = False
 
             cos_t = torch.cos(self.theta).to(device=device, dtype=dtype)
@@ -501,15 +520,23 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
     # ------------------------------------------------------------------
 
     def cache_bytes(self, *, batch_size: int, dtype: torch.dtype) -> int:
+        """Return total inference state size in bytes.
+
+        Includes KV buffers, routing norm caches, gate history, allowed
+        mask, and LRU metadata.
+        """
         B = int(batch_size)
         Hkv = self.num_kv_heads
         Dh = self.head_dim
         bytes_per = torch.tensor([], dtype=dtype).element_size()
         kv = 2 * B * Hkv * self.Lbuf * Dh * bytes_per
-        gates = B * self.window * 4
-        used_masks = B * self.Lbuf
-        lru = B * self.Me * 8
-        return int(kv + gates + used_masks + lru)
+        # Routing norm caches: exact bank V-routing + summary bank LF-K routing.
+        exact_norm = B * Hkv * self.Me * Dh * bytes_per if self.Me > 0 else 0
+        sum_norm = B * Hkv * self.Ms * self.lf_dim * bytes_per if self.Ms > 0 else 0
+        gates = B * self.window * 4  # float32 write gates
+        used_masks = B * self.Lbuf   # bool allowed mask
+        lru = B * self.Me * 8        # int64 LRU timestamps
+        return int(kv + exact_norm + sum_norm + gates + used_masks + lru)
 
     def reset_metrics(self, state: CoDAGQALandmarkStatePerf2) -> None:
         """Reset all metrics counters to zero.

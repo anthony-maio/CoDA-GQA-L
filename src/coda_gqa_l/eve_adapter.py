@@ -56,6 +56,8 @@ class EveCoDAAdapter(nn.Module):
         lambda_init_bias: float = -6.0,
         theta_init: float = math.pi / 2,
         eps: float = 1e-6,
+        head_norm_mode: str = "full",
+        rope_interleaved: bool = True,
         # Bounded-mode parameters (ignored when bounded=False)
         window: int = 256,
         num_landmarks_exact: int = 64,
@@ -75,6 +77,8 @@ class EveCoDAAdapter(nn.Module):
             lambda_init_bias: Initial bias for the differential lambda gate.
             theta_init: Initial angle for the orthogonal noise rotation.
             eps: Epsilon for HeadwiseRMSNorm.
+            head_norm_mode: "full" for HeadwiseRMSNorm, "identity" to bypass
+                (required for cold-swap evaluation without retraining).
             window: Recent window size (bounded mode only).
             num_landmarks_exact: Exact landmark bank capacity (bounded mode
                 only).
@@ -107,6 +111,8 @@ class EveCoDAAdapter(nn.Module):
                 lambda_init_bias=lambda_init_bias,
                 theta_init=theta_init,
                 eps=eps,
+                head_norm_mode=head_norm_mode,
+                rope_interleaved=rope_interleaved,
                 **coda_kwargs,
             )
         else:
@@ -118,6 +124,8 @@ class EveCoDAAdapter(nn.Module):
                 lambda_init_bias=lambda_init_bias,
                 theta_init=theta_init,
                 eps=eps,
+                head_norm_mode=head_norm_mode,
+                rope_interleaved=rope_interleaved,
             )
 
         # Inference state (bounded mode only).

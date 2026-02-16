@@ -347,16 +347,17 @@ def test_norm_cache_matches_actual():
             f"Max diff: {(state._exact_v_norm - expected_exact_norm).abs().max().item()}"
         )
 
-    # Summary bank V-routing norm cache.
+    # Summary bank LF-K routing norm cache.
     if Ms > 0:
-        actual_sum_v = state.v_buf[:, :, W + Me:W + Me + Ms, :]
-        expected_sum_norm = F.normalize(actual_sum_v, dim=-1, eps=1e-6)
-        assert state._sum_v_norm is not None, (
-            "_sum_v_norm should not be None when Ms > 0"
+        lf = model.lf_start
+        actual_sum_lf_k = state.k_buf[:, :, W + Me:W + Me + Ms, lf:]
+        expected_sum_norm = F.normalize(actual_sum_lf_k, dim=-1, eps=1e-6)
+        assert state._sum_lf_k_norm is not None, (
+            "_sum_lf_k_norm should not be None when Ms > 0"
         )
-        assert torch.allclose(state._sum_v_norm, expected_sum_norm, atol=1e-5), (
-            "Summary bank V-routing norm cache does not match F.normalize of v_buf summary slice. "
-            f"Max diff: {(state._sum_v_norm - expected_sum_norm).abs().max().item()}"
+        assert torch.allclose(state._sum_lf_k_norm, expected_sum_norm, atol=1e-5), (
+            "Summary bank LF-K routing norm cache does not match F.normalize of k_buf LF slice. "
+            f"Max diff: {(state._sum_lf_k_norm - expected_sum_norm).abs().max().item()}"
         )
 
 
@@ -367,7 +368,7 @@ def test_norm_cache_matches_actual():
 
 @torch.no_grad()
 def test_norm_cache_exists():
-    """After init_state, both _exact_v_norm and _sum_v_norm are not None
+    """After init_state, both _exact_v_norm and _sum_lf_k_norm are not None
     (when Me > 0 and Ms > 0 respectively)."""
     model, state = _make_model_and_state()
 
@@ -381,12 +382,13 @@ def test_norm_cache_exists():
         )
 
     if model.Ms > 0:
-        assert state._sum_v_norm is not None, (
-            "_sum_v_norm should be initialized when Ms > 0"
+        assert state._sum_lf_k_norm is not None, (
+            "_sum_lf_k_norm should be initialized when Ms > 0"
         )
-        expected_shape = (1, NUM_KV_HEADS, MS, model.head_dim)
-        assert state._sum_v_norm.shape == expected_shape, (
-            f"_sum_v_norm shape {state._sum_v_norm.shape} != {expected_shape}"
+        lf_dim = model.head_dim - model.lf_start
+        expected_shape = (1, NUM_KV_HEADS, MS, lf_dim)
+        assert state._sum_lf_k_norm.shape == expected_shape, (
+            f"_sum_lf_k_norm shape {state._sum_lf_k_norm.shape} != {expected_shape}"
         )
 
 
@@ -401,8 +403,8 @@ def test_norm_cache_none_when_zero_banks():
 
     # No summary bank.
     model_no_sum, state_no_sum = _make_model_and_state(num_landmarks_summary=0)
-    assert state_no_sum._sum_v_norm is None, (
-        "_sum_v_norm should be None when Ms=0"
+    assert state_no_sum._sum_lf_k_norm is None, (
+        "_sum_lf_k_norm should be None when Ms=0"
     )
 
 

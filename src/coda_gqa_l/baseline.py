@@ -48,6 +48,8 @@ class CoDAGQA(nn.Module):
         lambda_init_bias: float = -6.0,
         theta_init: float = math.pi / 2,
         eps: float = 1e-6,
+        head_norm_mode: str = "full",
+        rope_interleaved: bool = True,
     ):
         super().__init__()
         if embed_dim % num_heads != 0:
@@ -74,7 +76,14 @@ class CoDAGQA(nn.Module):
 
         self.rope = RotaryEmbedding(self.head_dim, base=rope_base)
 
-        self.head_norm = HeadwiseRMSNorm(self.head_dim, eps=eps)
+        self.head_norm_mode = head_norm_mode
+        if head_norm_mode == "full":
+            self.head_norm = HeadwiseRMSNorm(self.head_dim, eps=eps)
+        elif head_norm_mode == "identity":
+            self.head_norm = nn.Identity()
+        else:
+            raise ValueError(f"head_norm_mode must be 'full' or 'identity', got {head_norm_mode!r}")
+        self.rope_interleaved = bool(rope_interleaved)
         self.o_proj = nn.Linear(num_heads * self.head_dim, embed_dim, bias=False)
 
     def forward(
@@ -101,8 +110,8 @@ class CoDAGQA(nn.Module):
             offset = past_key_value[0].size(2)
 
         cos, sin = self.rope(seq_len=L, offset=offset, device=x.device, dtype=q.dtype)
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        q = apply_rope(q, cos, sin, interleaved=getattr(self, 'rope_interleaved', True))
+        k = apply_rope(k, cos, sin, interleaved=getattr(self, 'rope_interleaved', True))
 
         if past_key_value is not None:
             k = torch.cat([past_key_value[0], k], dim=2)
@@ -176,8 +185,8 @@ class BaselineGQA(nn.Module):
             offset = past_key_value[0].size(2)
 
         cos, sin = self.rope(seq_len=L, offset=offset, device=x.device, dtype=q.dtype)
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        q = apply_rope(q, cos, sin, interleaved=getattr(self, 'rope_interleaved', True))
+        k = apply_rope(k, cos, sin, interleaved=getattr(self, 'rope_interleaved', True))
 
         if past_key_value is not None:
             k = torch.cat([past_key_value[0], k], dim=2)
