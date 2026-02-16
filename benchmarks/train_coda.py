@@ -485,18 +485,17 @@ def eval_ppl_sequential(
 ) -> float:
     """Evaluate perplexity with non-overlapping sequential chunks.
 
-    Suitable for bounded/stateful models:
-    - Resets adapter state before starting
-    - Processes chunks sequentially without overlap
-    - Each chunk sees memory bank content from all previous chunks
+    Each chunk gets a **fresh state** (matching training behavior) so that
+    positions never exceed the model's trained context length.  Without this,
+    ``state.pos`` accumulates across chunks, producing RoPE embeddings far
+    beyond the trained range and inflating PPL to nonsense values (e.g. 2400
+    instead of ~65).
 
-    Also works for unbounded models (each chunk only sees its own context).
+    Long-range retention across chunks is tested separately via the needle
+    benchmark, not PPL.
     """
     was_training = model.training
     model.eval()
-
-    # Reset adapter states for clean eval.
-    reset_adapter_states(adapters)
 
     tokens = eval_tokens[:max_tokens] if max_tokens > 0 else eval_tokens
     input_ids = tokens.unsqueeze(0).to(device)
@@ -509,6 +508,13 @@ def eval_ppl_sequential(
         end = min(start + chunk_size, seq_len)
         if end - start < 2:
             break
+
+        # Fresh state per chunk: positions start at 0, banks are empty.
+        # This matches the training forward path (which also allocates fresh
+        # state per call) and keeps RoPE positions within the model's trained
+        # context window.
+        reset_adapter_states(adapters)
+
         chunk = input_ids[:, start:end]
         outputs = model(chunk, use_cache=False)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
@@ -525,7 +531,7 @@ def eval_ppl_sequential(
 
     ppl = torch.exp(torch.stack(nlls).sum() / n_tokens).item()
 
-    # Reset state after eval.
+    # Clean up.
     reset_adapter_states(adapters)
 
     if was_training:
