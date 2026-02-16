@@ -1106,8 +1106,18 @@ def main() -> None:
             detach_evicted=detach,
         )
 
-        # Gradient checkpointing on the new adapters.
-        if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        # Gradient checkpointing for Phase 2.
+        # When detach_evicted=False, prefill_chunked does in-place writes to
+        # state.k_buf/v_buf that maintain graph connections.  Gradient
+        # checkpointing re-runs the forward during backward, but in-place ops
+        # on graph-connected tensors can't be replayed after the first backward
+        # frees them → "backward through graph a second time" error.
+        # Fix: disable gradient checkpointing when gradient flow is needed.
+        if not detach:
+            if hasattr(model, "gradient_checkpointing_disable"):
+                model.gradient_checkpointing_disable()
+            print("  Gradient checkpointing: disabled (required for --no-detach-evicted)")
+        elif args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False},
             )
