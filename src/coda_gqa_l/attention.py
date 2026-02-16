@@ -186,7 +186,26 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
     # State init
     # ------------------------------------------------------------------
 
-    def init_state(self, *, batch_size: int, device: torch.device, dtype: torch.dtype) -> CoDAGQALandmarkStatePerf2:
+    def init_state(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        mem_init: Optional[str] = None,
+    ) -> CoDAGQALandmarkStatePerf2:
+        """Create a fresh KV cache state.
+
+        Args:
+            batch_size: Batch size.
+            device: Target device.
+            dtype: Data type for KV buffers.
+            mem_init: Override for memory bank initialization strategy.
+                ``None`` (default) uses ``self.mem_init``.  Pass ``"zeros"``
+                during training for deterministic initialization that is safe
+                with gradient checkpointing (avoids RNG-dependent shapes on
+                recomputation).
+        """
         B = int(batch_size)
         Hkv = self.num_kv_heads
         Dh = self.head_dim
@@ -199,7 +218,8 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
 
         mem_last_exact = torch.zeros((B, self.Me), device=device, dtype=torch.int64) if self.Me > 0 else torch.zeros((B, 0), device=device, dtype=torch.int64)
 
-        if self.mem_init == "random_normal":
+        _mem_init = mem_init if mem_init is not None else self.mem_init
+        if _mem_init == "random_normal":
             if self.Me > 0:
                 k_buf[:, :, self.window:self.window + self.Me, :].normal_(mean=0.0, std=0.02)
                 v_buf[:, :, self.window:self.window + self.Me, :].normal_(mean=0.0, std=0.02)
@@ -207,7 +227,7 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
                 # Phase-Safe: HF key band stays zero, only LF band is initialized.
                 k_buf[:, :, self.window + self.Me:, self.lf_start:].normal_(mean=0.0, std=0.02)
                 v_buf[:, :, self.window + self.Me:, :].normal_(mean=0.0, std=0.02)
-        elif self.mem_init == "zeros":
+        elif _mem_init == "zeros":
             pass
         else:
             raise ValueError("mem_init must be 'zeros' or 'random_normal'")

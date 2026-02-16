@@ -344,23 +344,28 @@ class EveCoDAAdapter(nn.Module):
         """Route through bounded KV cache: prefill for L>1, step for L==1."""
         B, L, C = x.shape
 
-        # Auto-initialise state on first call.
+        # Training: stateless forward for gradient-checkpointing safety.
+        # See LlamaCoDAAdapter._forward_bounded for full rationale.
+        if self.training:
+            state = self.coda.init_state(
+                batch_size=B, device=x.device, dtype=x.dtype,
+                mem_init="zeros",
+            )
+            y, _ = self.coda.prefill_chunked(x, state, block_size=self.block_size)
+            return y
+
+        # Inference: stateful streaming with persistent state.
         if self._state is None:
             self._state = self.coda.init_state(
                 batch_size=B, device=x.device, dtype=x.dtype,
             )
 
-        state = self._state
-
         if L == 1:
-            # Autoregressive decode: single token step.
-            y, self._state = self.coda.step(x, state)
+            y, self._state = self.coda.step(x, self._state)
         else:
-            # Prefill: process in chunks to populate the bounded cache.
             y, self._state = self.coda.prefill_chunked(
-                x, state, block_size=self.block_size,
+                x, self._state, block_size=self.block_size,
             )
-
         return y
 
     # ------------------------------------------------------------------

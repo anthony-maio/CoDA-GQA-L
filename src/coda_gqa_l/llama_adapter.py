@@ -301,6 +301,22 @@ class LlamaCoDAAdapter(nn.Module):
     def _forward_bounded(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
 
+        # Training: stateless forward for gradient-checkpointing safety.
+        # Gradient checkpointing recomputes the forward during backward.
+        # If we persist state across calls, recomputation sees already-mutated
+        # buffers and produces tensors with different shapes -> CheckpointError.
+        # Fix: allocate a fresh local state each forward so first pass and
+        # recomputation are identical.  Uses zeros init for determinism
+        # (random_normal would advance the RNG differently on recompute).
+        if self.training:
+            state = self.coda.init_state(
+                batch_size=B, device=x.device, dtype=x.dtype,
+                mem_init="zeros",
+            )
+            y, _ = self.coda.prefill_chunked(x, state, block_size=self.block_size)
+            return y
+
+        # Inference: stateful streaming with persistent state.
         if self._state is None:
             self._state = self.coda.init_state(
                 batch_size=B, device=x.device, dtype=x.dtype,
