@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from datetime import datetime
@@ -101,13 +102,29 @@ def count_params(model: nn.Module, trainable_only: bool = False) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _token_cache_dir() -> Path:
+    """Persistent cache directory that survives CWD changes.
+
+    Priority: $CODA_TOKEN_CACHE > /workspace/.token_cache (RunPod) >
+    script-relative .token_cache.
+    """
+    env = os.environ.get("CODA_TOKEN_CACHE")
+    if env:
+        return Path(env)
+    # RunPod /workspace is persistent across restarts
+    if Path("/workspace").is_dir():
+        return Path("/workspace/.token_cache")
+    # Fall back to script directory (not CWD)
+    return Path(__file__).resolve().parent / ".token_cache"
+
+
 def _token_cache_path(model_name: str, dataset_name: str, seq_len: int, split: str = "train") -> Path:
     """Deterministic cache path for tokenized data."""
     import hashlib
     key = f"{model_name}|{dataset_name}|{seq_len}|{split}"
     h = hashlib.md5(key.encode()).hexdigest()[:12]
     safe_name = model_name.replace("/", "_")
-    return Path(".token_cache") / f"{safe_name}_{dataset_name}_{split}_{seq_len}_{h}.pt"
+    return _token_cache_dir() / f"{safe_name}_{dataset_name}_{split}_{seq_len}_{h}.pt"
 
 
 def load_train_tokens(
