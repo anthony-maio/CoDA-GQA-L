@@ -101,11 +101,32 @@ def count_params(model: nn.Module, trainable_only: bool = False) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _token_cache_path(model_name: str, dataset_name: str, seq_len: int, split: str = "train") -> Path:
+    """Deterministic cache path for tokenized data."""
+    import hashlib
+    key = f"{model_name}|{dataset_name}|{seq_len}|{split}"
+    h = hashlib.md5(key.encode()).hexdigest()[:12]
+    safe_name = model_name.replace("/", "_")
+    return Path(".token_cache") / f"{safe_name}_{dataset_name}_{split}_{seq_len}_{h}.pt"
+
+
 def load_train_tokens(
     tokenizer, seq_len: int, dataset_name: str = "wikitext-103",
+    model_name: str = "",
 ) -> torch.Tensor:
-    """Load and chunk training data. Returns tensor (N, seq_len)."""
+    """Load and chunk training data. Returns tensor (N, seq_len).
+
+    Caches tokenized chunks to disk so subsequent runs skip the ~10 min
+    tokenization step for large datasets like wikitext-103.
+    """
     print(f"  Dataset: {dataset_name}")
+
+    cache = _token_cache_path(model_name, dataset_name, seq_len, "train")
+    if cache.exists():
+        print(f"  Loading cached tokens from {cache}")
+        chunks = torch.load(cache, map_location="cpu", weights_only=True)
+        print(f"  {chunks.shape[0]:,} chunks x {seq_len} = {chunks.numel():,} tokens")
+        return chunks
 
     if dataset_name in ("wikitext-103", "wikitext-2"):
         config_name = (
@@ -128,16 +149,36 @@ def load_train_tokens(
     n = len(tokens) // seq_len
     chunks = tokens[: n * seq_len].view(n, seq_len)
     print(f"  {n:,} chunks x {seq_len} = {n * seq_len:,} tokens")
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(chunks, cache)
+    print(f"  Cached tokens to {cache} ({cache.stat().st_size / 1024 / 1024:.0f} MB)")
+
     return chunks
 
 
-def load_eval_tokens(tokenizer, max_tokens: int = 50_000) -> torch.Tensor:
-    """Load WikiText-2 test tokens for evaluation."""
+def load_eval_tokens(
+    tokenizer, max_tokens: int = 50_000, model_name: str = "",
+) -> torch.Tensor:
+    """Load WikiText-2 test tokens for evaluation.
+
+    Caches to disk like load_train_tokens.
+    """
+    cache = _token_cache_path(model_name, "wikitext-2-eval", max_tokens, "test")
+    if cache.exists():
+        print(f"  Loading cached eval tokens from {cache}")
+        return torch.load(cache, map_location="cpu", weights_only=True)
+
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     text = "\n\n".join(t for t in ds["text"] if t.strip())
     tokens = tokenizer(text, return_tensors="pt").input_ids[0]
     if max_tokens and len(tokens) > max_tokens:
         tokens = tokens[:max_tokens]
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(tokens, cache)
+    print(f"  Cached eval tokens to {cache}")
+
     return tokens
 
 
@@ -874,9 +915,11 @@ def main() -> None:
 
     # --- Data ---
     print(f"\n--- Data ---")
-    train_chunks = load_train_tokens(tokenizer, args.seq_len, args.dataset)
+    train_chunks = load_train_tokens(
+        tokenizer, args.seq_len, args.dataset, model_name=args.model,
+    )
     eval_tokens = (
-        load_eval_tokens(tokenizer, args.eval_tokens)
+        load_eval_tokens(tokenizer, args.eval_tokens, model_name=args.model)
         if args.eval_every > 0
         else None
     )
