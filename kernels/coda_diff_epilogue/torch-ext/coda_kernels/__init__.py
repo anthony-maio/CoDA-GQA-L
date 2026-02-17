@@ -13,11 +13,13 @@ from typing import Optional
 
 import torch
 
-# Load the compiled ops
+# Load the compiled extension first (triggers TORCH_LIBRARY registration),
+# then access the registered ops via torch.ops.
 try:
-    from torch.ops import coda_kernels as ops
+    import coda_kernels._ops  # noqa: F401 -- side-effect: registers ops
+    ops = torch.ops.coda_kernels
     _HAS_KERNEL = True
-except (ImportError, RuntimeError):
+except (ImportError, RuntimeError, AttributeError):
     _HAS_KERNEL = False
 
 
