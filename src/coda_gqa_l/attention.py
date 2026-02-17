@@ -41,6 +41,14 @@ try:
 except ImportError:
     _HAS_FUSED_EPILOGUE = False
 
+# PyTorch 2.5+: lower-right causal bias enables FlashAttention for prefix+block
+# attention (Lq < Lk) without needing an explicit boolean mask.
+_causal_lr_bias = None
+try:
+    from torch.nn.attention.bias import causal_lower_right as _causal_lr_bias
+except ImportError:
+    pass
+
 # Re-export so `from .attention import CoDAGQALandmarkStatePerf2` still works.
 __all__ = ["CoDAGQALandmarkPerf2", "CoDAGQALandmarkStatePerf2"]
 
@@ -309,7 +317,7 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         q_noise: torch.Tensor,  # (B,H,Lq,Dh)
         k: torch.Tensor,        # (B,Hkv,Lk,Dh)
         v: torch.Tensor,        # (B,Hkv,Lk,Dh)
-        attn_mask: Optional[torch.Tensor],  # broadcastable to (B,2H,Lq,Lk)
+        attn_mask,  # Tensor, _CausalBias, or None; broadcastable to (B,2H,Lq,Lk)
         lam: torch.Tensor,      # (B,H,Lq,1)
         is_causal: bool = False,
     ) -> torch.Tensor:
@@ -513,24 +521,32 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
             # Build attention mask.
             # NOTE: is_causal=True uses upper-left alignment in PyTorch (>=2.5),
             # which is WRONG when Lq < Lk (prefix-LM pattern). We need all
-            # queries to see the full prefix plus causal within the block,
-            # so we always construct an explicit mask when there is a prefix.
+            # queries to see the full prefix plus causal within the block.
             #
-            # SDPA bool mask: True = keep/participate, False = mask out (-inf).
+            # Our prefix+block pattern IS lower-right causal: query i sees
+            # all prefix tokens + block tokens 0..i. PyTorch 2.5+ provides
+            # causal_lower_right() which the SDPA dispatcher recognizes and
+            # routes to FlashAttention — unlike explicit boolean masks which
+            # force fallback to the math kernel.
             Lk_total = k_all.size(2)
             if Lk_total == blk:
                 # No prefix → square attention → is_causal=True is correct.
                 attn_mask = None
                 is_causal = True
+            elif _causal_lr_bias is not None and B == 1:
+                # PyTorch 2.5+, B==1: lower-right causal bias → FlashAttention.
+                # Safe for B==1: if use_packing removed invalid slots, all
+                # remaining are valid. If not packing, either all slots are
+                # valid (allowed_prev.all()) or mask_unused_memory is off.
+                attn_mask = _causal_lr_bias(blk, Lk_total)
+                is_causal = False
             else:
-                # Prefix + block → explicit prefix-causal mask.
+                # B>1 or PyTorch < 2.5: explicit boolean mask (no FlashAttention).
                 causal = self._get_causal_mask(Lprev=Lk_total - blk, blk=blk, device=device)
                 if use_packing:
-                    # Packed: all remaining slots are valid, mask is just the causal pattern.
                     attn_mask = causal.view(1, 1, blk, Lk_total)
                     is_causal = False
                 else:
-                    # Non-packed: also AND with allowed mask to hide invalid slots.
                     if self.mask_unused_memory:
                         block_ok = torch.ones((B, blk), device=device, dtype=torch.bool)
                         allowed = torch.cat([allowed_prev, block_ok], dim=1)
