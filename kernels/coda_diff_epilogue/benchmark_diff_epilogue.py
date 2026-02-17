@@ -72,9 +72,13 @@ def main():
     has_kernel = False
     if not args.no_kernel:
         try:
-            from coda_kernels import diff_epilogue, is_available
+            from coda_kernels import diff_epilogue, is_available, diagnose
             has_kernel = is_available()
             print(f"Fused kernel: {'LOADED' if has_kernel else 'FALLBACK (not compiled)'}")
+            if not has_kernel:
+                print(f"\n--- Kernel diagnostics ---")
+                print(diagnose())
+                print(f"--- end diagnostics ---\n")
         except ImportError:
             print("Fused kernel: NOT INSTALLED (run pip install -e .)")
     else:
