@@ -48,9 +48,10 @@ Falls back to unfused PyTorch automatically if the kernel isn't compiled.
 
 | GPU | Compute Cap | Vectorization | Status |
 |-----|-------------|---------------|--------|
-| H100 | sm_90 | bf16x2 | Primary target |
-| A100 | sm_80 | bf16x2 | Supported |
-| T4 | sm_75 | fp16x2 | Supported (no bf16) |
+| Blackwell | sm_120 | bf16x2 | Supported (via PTX) |
+| H100 | sm_90 | bf16x2 | Primary target (SASS) |
+| A100 | sm_80 | bf16x2 | Supported (SASS) |
+| T4 | sm_75 | fp16x2 | Supported (SASS, no bf16) |
 
 ## Files
 

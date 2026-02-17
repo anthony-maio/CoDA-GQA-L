@@ -21,9 +21,10 @@ setup(
                 "nvcc": [
                     "-O3",
                     "--use_fast_math",
-                    "-gencode=arch=compute_75,code=sm_75",   # T4
-                    "-gencode=arch=compute_80,code=sm_80",   # A100
-                    "-gencode=arch=compute_90,code=sm_90",   # H100
+                    "-gencode=arch=compute_75,code=sm_75",     # T4 (SASS)
+                    "-gencode=arch=compute_80,code=sm_80",     # A100 (SASS)
+                    "-gencode=arch=compute_90,code=sm_90",     # H100 (SASS)
+                    "-gencode=arch=compute_90,code=compute_90",  # PTX fallback (Blackwell+)
                 ],
             },
         ),
