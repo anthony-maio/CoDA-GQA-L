@@ -1,0 +1,12 @@
+[general]
+name = "coda_kernels"
+backends = ["cuda"]
+
+[torch]
+src = ["torch-ext/torch_binding.cpp"]
+
+[kernel.diff_epilogue]
+backend = "cuda"
+src = ["kernel_src/diff_epilogue.cu"]
+depends = ["torch"]
+cuda-capabilities = ["7.5", "8.0", "9.0"]

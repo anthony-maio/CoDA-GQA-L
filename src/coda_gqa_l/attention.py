@@ -34,6 +34,13 @@ from .primitives import (
 )
 from .state import CoDAGQALandmarkStatePerf2
 
+# Optional fused kernel: auto-detected, falls back to unfused PyTorch.
+try:
+    from coda_kernels import diff_epilogue as _fused_diff_epilogue, is_available as _kernel_available
+    _HAS_FUSED_EPILOGUE = _kernel_available()
+except ImportError:
+    _HAS_FUSED_EPILOGUE = False
+
 # Re-export so `from .attention import CoDAGQALandmarkStatePerf2` still works.
 __all__ = ["CoDAGQALandmarkPerf2", "CoDAGQALandmarkStatePerf2"]
 
@@ -327,8 +334,21 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         H = self.num_heads
         out_sig = out_cat[:, :H, :, :]
         out_noise = out_cat[:, H:, :, :]
-        out = out_sig - lam * out_noise
-        out = self.head_norm(out)
+
+        # Fused path: subtract + RMSNorm + weight in one CUDA kernel pass.
+        # Falls back to unfused PyTorch when kernel is not compiled.
+        if (
+            _HAS_FUSED_EPILOGUE
+            and self.head_norm_mode == "full"
+            and out_sig.is_cuda
+        ):
+            out = _fused_diff_epilogue(
+                out_sig.contiguous(), out_noise.contiguous(),
+                lam, self.head_norm.weight, eps=self.head_norm.eps,
+            )
+        else:
+            out = out_sig - lam * out_noise
+            out = self.head_norm(out)
         return out
 
     def _to_output(self, out_heads: torch.Tensor) -> torch.Tensor:

@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel", "torch>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coda-kernels"
+version = "0.1.0"
+description = "Fused CUDA kernels for CoDA-GQA-L differential attention"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.0"]
