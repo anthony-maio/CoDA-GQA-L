@@ -1139,22 +1139,23 @@ def main() -> None:
             detach_evicted=detach,
         )
 
-        # Gradient checkpointing for Phase 2.
-        # When detach_evicted=False, prefill_chunked does in-place writes to
-        # state.k_buf/v_buf that maintain graph connections.  Gradient
-        # checkpointing re-runs the forward during backward, but in-place ops
-        # on graph-connected tensors can't be replayed after the first backward
-        # frees them → "backward through graph a second time" error.
-        # Fix: disable gradient checkpointing when gradient flow is needed.
+        # Gradient checkpointing must be disabled for Phase 2 (always).
+        # The bounded forward accumulates variable-size landmark bank state
+        # per sequence: the exact bank grows by a data-dependent number of
+        # tokens per chunk (novelty-filtered, float-sensitive threshold).
+        # GC recomputes the forward during backward; borderline tokens flip
+        # in/out of the bank due to float non-determinism, yielding different
+        # tensor shapes → CheckpointError.  Both reentrant and non-reentrant
+        # modes fail.  H100/A100 (80 GB) have enough VRAM for Phase 2 without
+        # GC; peak is ~40-50 GB at batch=1 seq=2048.
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+        if args.gradient_checkpointing:
+            print("  Gradient checkpointing: disabled for Phase 2 "
+                  "(incompatible with bounded landmark state)")
         if not detach:
-            if hasattr(model, "gradient_checkpointing_disable"):
-                model.gradient_checkpointing_disable()
-            print("  Gradient checkpointing: disabled (required for --no-detach-evicted)")
-        elif args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False},
-            )
-            model.config.use_cache = False
+            print("  (Also required for --no-detach-evicted: "
+                  "in-place graph ops cannot be replayed)")
 
         # Set up optimizer for Phase 2: all adapter params trainable,
         # with lower LR to avoid catastrophic forgetting.

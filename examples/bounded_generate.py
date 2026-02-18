@@ -152,6 +152,7 @@ def main():
 
     loaded, skipped = 0, 0
     for i, layer in enumerate(model.model.layers):
+        layer_device = next(layer.parameters()).device  # capture before load_state_dict moves weights to CPU
         key = f"layer_{i}"
         if key in ckpt:
             missing, unexpected = layer.self_attn.load_state_dict(
@@ -162,6 +163,9 @@ def main():
                 skipped += len(missing)
         else:
             print(f"  WARNING: no checkpoint entry for layer {i}")
+        # load_state_dict replaces GPU params with CPU tensors (ckpt was
+        # loaded map_location="cpu").  Move back to the layer's device.
+        layer.self_attn = layer.self_attn.to(device=layer_device, dtype=dtype)
 
     print(f"  Loaded {loaded}/{num_layers} layers "
           f"({skipped} bounded-only params kept at default init)")
