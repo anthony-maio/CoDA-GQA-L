@@ -323,31 +323,23 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         q_noise: torch.Tensor,  # (B,H,Lq,Dh)
         k: torch.Tensor,        # (B,Hkv,Lk,Dh)
         v: torch.Tensor,        # (B,Hkv,Lk,Dh)
-        attn_mask,  # Tensor, _CausalBias, or None; broadcastable to (B,2H,Lq,Lk)
+        attn_mask,  # Tensor, _CausalBias, or None; broadcastable to (B,H,Lq,Lk)
         lam: torch.Tensor,      # (B,H,Lq,1)
         is_causal: bool = False,
     ) -> torch.Tensor:
-        q_cat = torch.cat([q, q_noise], dim=1)  # (B,2H,Lq,Dh)
-
-        # GQA head alignment for stacked two-stream attention:
-        # q_cat = [sig_h0..sig_h{H-1}, noise_h0..noise_h{H-1}]
-        # We need each signal head and its noise counterpart to attend
-        # to the SAME KV head.  First expand KV for normal GQA (Hkv→H),
-        # then duplicate for the noise stream (H→2H).
-        # This gives [kv0xG, kv1xG, ..., kv0xG, kv1xG, ...] which
-        # correctly aligns with [signal heads | noise heads].
+        # Two separate SDPA calls sharing the same K/V, avoiding the 2x
+        # memory + bandwidth cost of cat([k_gqa, k_gqa], dim=1).
+        # The extra kernel launch is cheap vs halving K/V read traffic.
         groups = self.num_heads // self.num_kv_heads
         k_gqa = repeat_kv(k, groups)   # (B, H, Lk, Dh)
         v_gqa = repeat_kv(v, groups)   # (B, H, Lk, Dh)
-        k_rep = torch.cat([k_gqa, k_gqa], dim=1)  # (B, 2H, Lk, Dh)
-        v_rep = torch.cat([v_gqa, v_gqa], dim=1)  # (B, 2H, Lk, Dh)
-        out_cat = F.scaled_dot_product_attention(
-            q_cat, k_rep, v_rep, attn_mask=attn_mask, is_causal=is_causal,
-        )
 
-        H = self.num_heads
-        out_sig = out_cat[:, :H, :, :]
-        out_noise = out_cat[:, H:, :, :]
+        out_sig = F.scaled_dot_product_attention(
+            q, k_gqa, v_gqa, attn_mask=attn_mask, is_causal=is_causal,
+        )
+        out_noise = F.scaled_dot_product_attention(
+            q_noise, k_gqa, v_gqa, attn_mask=attn_mask, is_causal=is_causal,
+        )
 
         # Fused path: CUDA kernel avoids intermediate tensor allocations.
         # Falls back to unfused PyTorch when kernel is not compiled.
