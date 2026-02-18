@@ -208,6 +208,7 @@ def swap_attention(
     model: nn.Module,
     head_norm_mode: str = "identity",
     theta_init: float = 0.0,
+    lambda_init_bias: float = -6.0,
     bounded: bool = False,
     window: int = 256,
     num_landmarks_exact: int = 64,
@@ -240,6 +241,7 @@ def swap_attention(
             bounded=bounded,
             head_norm_mode=head_norm_mode,
             theta_init=theta_init,
+            lambda_init_bias=lambda_init_bias,
             rope_interleaved=False,  # Llama convention
             window=window,
             num_landmarks_exact=num_landmarks_exact,
@@ -372,6 +374,23 @@ def freeze_params(
     n_train = count_params(model, trainable_only=True)
     n_total = count_params(model)
     print(f"  Trainable: {n_train:,} / {n_total:,} ({100 * n_train / n_total:.1f}%)")
+
+
+def freeze_differential(adapters: List[LlamaCoDAAdapter]) -> None:
+    """Freeze theta and lambda_proj so differential attention is fully disabled.
+
+    Used for ablation: with theta=0 (no rotation) and lambda≈0 (no noise
+    subtraction), the model behaves as standard GQA. Freezing prevents
+    these params from learning during training, isolating the contribution
+    of the bounded memory banks alone.
+    """
+    n_frozen = 0
+    for adapter in adapters:
+        for name, p in adapter.named_parameters():
+            if "theta" in name or "lambda_proj" in name:
+                p.requires_grad = False
+                n_frozen += 1
+    print(f"  Ablation: froze {n_frozen} differential params (theta + lambda_proj)")
 
 
 def setup_optimizer(
@@ -963,6 +982,14 @@ Examples:
                          "Enables write_proj and summary_eta_logit to receive gradients. "
                          "Experimental: may increase memory usage.")
 
+    # Ablation.
+    p.add_argument("--no-differential", action="store_true",
+                    help="Ablation: disable differential attention entirely. "
+                         "Sets theta=0 and lambda=0 (frozen), so the model uses "
+                         "standard GQA. Memory banks still operate normally. "
+                         "Use with --max-steps 0 --bounded-steps N to test "
+                         "bounded cache without differential attention.")
+
     # Hardware.
     p.add_argument("--dtype", type=str, default="bf16",
                     choices=["bf16", "fp32"])
@@ -1004,6 +1031,8 @@ def main() -> None:
     print(f"  Batch:     {args.batch_size} x {args.grad_accum} accum x {args.seq_len} seq")
     print(f"  Eff batch: {eff_batch:,} tokens/update")
     print(f"  Freeze:    {args.freeze}")
+    if args.no_differential:
+        print(f"  Ablation:  --no-differential (standard GQA, no theta/lambda)")
     print(f"  Output:    {output_dir}")
 
     # --- Load model ---
@@ -1020,10 +1049,12 @@ def main() -> None:
     print(f"  Params: {total_params:,}")
 
     # --- Swap attention ---
+    lambda_init_bias = -100.0 if args.no_differential else -6.0
     model, adapters = swap_attention(
         model,
         head_norm_mode=args.head_norm_mode,
-        theta_init=args.theta_init,
+        theta_init=0.0 if args.no_differential else args.theta_init,
+        lambda_init_bias=lambda_init_bias,
     )
 
     # --- Gradient checkpointing ---
@@ -1037,6 +1068,8 @@ def main() -> None:
     # --- Freeze + optimizer ---
     print(f"\n--- Optimizer ---")
     freeze_params(model, adapters, args.freeze)
+    if args.no_differential:
+        freeze_differential(adapters)
     optimizer = setup_optimizer(
         model, adapters, args.lr, args.lr_coda, args.weight_decay,
     )
@@ -1127,6 +1160,8 @@ def main() -> None:
         # with lower LR to avoid catastrophic forgetting.
         print(f"\n--- Phase 2 Optimizer ---")
         freeze_params(model, adapters_b, args.freeze)
+        if args.no_differential:
+            freeze_differential(adapters_b)
         lr_p2 = args.lr * args.bounded_lr_scale
         lr_coda_p2 = args.lr_coda * args.bounded_lr_scale
         optimizer_p2 = setup_optimizer(
