@@ -47,6 +47,15 @@ try:
 except ImportError:
     _HAS_FUSED_EPILOGUE = False
 
+# Triton fused differential FlashAttention: loads K/V once from HBM,
+# computes both attention streams + differential epilogue in one pass.
+try:
+    from triton_diff_flash import diff_flash_attn as _triton_diff_flash
+    from triton_diff_flash import is_available as _triton_flash_available
+    _HAS_TRITON_FLASH = _triton_flash_available()
+except ImportError:
+    _HAS_TRITON_FLASH = False
+
 # PyTorch 2.5+: lower-right causal bias enables FlashAttention for prefix+block
 # attention (Lq < Lk) without needing an explicit boolean mask.
 _causal_lr_bias = None
@@ -327,9 +336,19 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         lam: torch.Tensor,      # (B,H,Lq,1)
         is_causal: bool = False,
     ) -> torch.Tensor:
-        # Two separate SDPA calls sharing the same K/V, avoiding the 2x
-        # memory + bandwidth cost of cat([k_gqa, k_gqa], dim=1).
-        # The extra kernel launch is cheap vs halving K/V read traffic.
+        # Fast path: Triton fused kernel loads K/V once, computes both
+        # streams + epilogue in a single pass.  Only when attn_mask is None
+        # (kernel handles is_causal internally; explicit masks fall through).
+        if _HAS_TRITON_FLASH and q.is_cuda and attn_mask is None:
+            rms_w = self.head_norm.weight if self.head_norm_mode == "full" else None
+            eps = self.head_norm.eps if self.head_norm_mode == "full" else 1e-6
+            return _triton_diff_flash(
+                q, q_noise, k, v, lam,
+                rms_weight=rms_w, eps=eps, is_causal=is_causal,
+            )
+
+        # Fallback: two separate SDPA calls sharing the same K/V, avoiding
+        # the 2x memory + bandwidth cost of cat([k_gqa, k_gqa], dim=1).
         groups = self.num_heads // self.num_kv_heads
         k_gqa = repeat_kv(k, groups)   # (B, H, Lk, Dh)
         v_gqa = repeat_kv(v, groups)   # (B, H, Lk, Dh)
@@ -341,8 +360,7 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
             q_noise, k_gqa, v_gqa, attn_mask=attn_mask, is_causal=is_causal,
         )
 
-        # Fused path: CUDA kernel avoids intermediate tensor allocations.
-        # Falls back to unfused PyTorch when kernel is not compiled.
+        # Fused epilogue: CUDA kernel avoids intermediate tensor allocations.
         if _HAS_FUSED_EPILOGUE and out_sig.is_cuda:
             if self.head_norm_mode == "full":
                 out = _fused_diff_epilogue(
@@ -350,7 +368,6 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
                     lam, self.head_norm.weight, eps=self.head_norm.eps,
                 )
             else:
-                # identity mode: just fused subtract (no RMSNorm)
                 out = _fused_diff_sub_only(
                     out_sig.contiguous(), out_noise.contiguous(), lam,
                 )
