@@ -333,6 +333,135 @@ static int get_threads(int head_dim, bool vectorized) {
     return threads;
 }
 
+// ---------------------------------------------------------------------------
+// BF16 subtract-only kernel (identity head norm, no RMSNorm)
+// Fuses: output = out_sig - lam * out_noise
+// ---------------------------------------------------------------------------
+
+__global__ void diff_sub_only_bf16_vec(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ out_sig,
+    const __nv_bfloat16* __restrict__ out_noise,
+    const __nv_bfloat16* __restrict__ lam,
+    const int head_dim
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    const __nv_bfloat16* row_sig   = out_sig   + row * head_dim;
+    const __nv_bfloat16* row_noise = out_noise  + row * head_dim;
+    __nv_bfloat16* row_out = output + row * head_dim;
+
+    const float lambda_val = __bfloat162float(lam[row]);
+
+    const int vec_dim = head_dim / 2;
+    const __nv_bfloat162* vec_sig   = reinterpret_cast<const __nv_bfloat162*>(row_sig);
+    const __nv_bfloat162* vec_noise = reinterpret_cast<const __nv_bfloat162*>(row_noise);
+    __nv_bfloat162* vec_out = reinterpret_cast<__nv_bfloat162*>(row_out);
+
+    #pragma unroll 4
+    for (int i = tid; i < vec_dim; i += stride) {
+        __nv_bfloat162 s = vec_sig[i];
+        __nv_bfloat162 n = vec_noise[i];
+
+        float s0 = __bfloat162float(s.x);
+        float s1 = __bfloat162float(s.y);
+        float n0 = __bfloat162float(n.x);
+        float n1 = __bfloat162float(n.y);
+
+        __nv_bfloat162 result;
+        result.x = __float2bfloat16(s0 - lambda_val * n0);
+        result.y = __float2bfloat16(s1 - lambda_val * n1);
+        vec_out[i] = result;
+    }
+
+    if (head_dim % 2 == 1 && tid == 0) {
+        float s = __bfloat162float(row_sig[head_dim - 1]);
+        float n = __bfloat162float(row_noise[head_dim - 1]);
+        row_out[head_dim - 1] = __float2bfloat16(s - lambda_val * n);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP16 subtract-only kernel
+// ---------------------------------------------------------------------------
+
+__global__ void diff_sub_only_fp16_vec(
+    __half* __restrict__ output,
+    const __half* __restrict__ out_sig,
+    const __half* __restrict__ out_noise,
+    const __half* __restrict__ lam,
+    const int head_dim
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    const __half* row_sig   = out_sig   + row * head_dim;
+    const __half* row_noise = out_noise + row * head_dim;
+    __half* row_out = output + row * head_dim;
+
+    const float lambda_val = __half2float(lam[row]);
+
+    const int vec_dim = head_dim / 2;
+    const __half2* vec_sig   = reinterpret_cast<const __half2*>(row_sig);
+    const __half2* vec_noise = reinterpret_cast<const __half2*>(row_noise);
+    __half2* vec_out = reinterpret_cast<__half2*>(row_out);
+
+    #pragma unroll 4
+    for (int i = tid; i < vec_dim; i += stride) {
+        __half2 s = vec_sig[i];
+        __half2 n = vec_noise[i];
+
+        float s0 = __half2float(s.x);
+        float s1 = __half2float(s.y);
+        float n0 = __half2float(n.x);
+        float n1 = __half2float(n.y);
+
+        __half2 result;
+        result.x = __float2half(s0 - lambda_val * n0);
+        result.y = __float2half(s1 - lambda_val * n1);
+        vec_out[i] = result;
+    }
+
+    if (head_dim % 2 == 1 && tid == 0) {
+        float s = __half2float(row_sig[head_dim - 1]);
+        float n = __half2float(row_noise[head_dim - 1]);
+        row_out[head_dim - 1] = __float2half(s - lambda_val * n);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP32 subtract-only kernel
+// ---------------------------------------------------------------------------
+
+__global__ void diff_sub_only_fp32(
+    float* __restrict__ output,
+    const float* __restrict__ out_sig,
+    const float* __restrict__ out_noise,
+    const float* __restrict__ lam,
+    const int head_dim
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    const float* row_sig   = out_sig   + row * head_dim;
+    const float* row_noise = out_noise + row * head_dim;
+    float* row_out = output + row * head_dim;
+
+    const float lambda_val = lam[row];
+
+    for (int i = tid; i < head_dim; i += stride) {
+        row_out[i] = row_sig[i] - lambda_val * row_noise[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C entry points (called from torch_binding.cpp)
+// ---------------------------------------------------------------------------
+
 extern "C" {
 
 void diff_epilogue_forward_bf16(
@@ -386,6 +515,53 @@ void diff_epilogue_forward_fp32(
     size_t smem = ((threads + WARP_SIZE - 1) / WARP_SIZE) * sizeof(float);
     diff_epilogue_fp32<<<num_rows, threads, smem, stream>>>(
         output, out_sig, out_noise, lam, weight, head_dim, eps
+    );
+}
+
+// --- Subtract-only entry points (identity head norm) ---
+
+void diff_sub_only_forward_bf16(
+    __nv_bfloat16* output,
+    const __nv_bfloat16* out_sig,
+    const __nv_bfloat16* out_noise,
+    const __nv_bfloat16* lam,
+    int num_rows,
+    int head_dim,
+    cudaStream_t stream
+) {
+    int threads = get_threads(head_dim, true);
+    diff_sub_only_bf16_vec<<<num_rows, threads, 0, stream>>>(
+        output, out_sig, out_noise, lam, head_dim
+    );
+}
+
+void diff_sub_only_forward_fp16(
+    __half* output,
+    const __half* out_sig,
+    const __half* out_noise,
+    const __half* lam,
+    int num_rows,
+    int head_dim,
+    cudaStream_t stream
+) {
+    int threads = get_threads(head_dim, true);
+    diff_sub_only_fp16_vec<<<num_rows, threads, 0, stream>>>(
+        output, out_sig, out_noise, lam, head_dim
+    );
+}
+
+void diff_sub_only_forward_fp32(
+    float* output,
+    const float* out_sig,
+    const float* out_noise,
+    const float* lam,
+    int num_rows,
+    int head_dim,
+    cudaStream_t stream
+) {
+    int threads = get_threads(head_dim, false);
+    diff_sub_only_fp32<<<num_rows, threads, 0, stream>>>(
+        output, out_sig, out_noise, lam, head_dim
     );
 }
 

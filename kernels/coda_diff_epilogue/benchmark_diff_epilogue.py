@@ -72,7 +72,7 @@ def main():
     has_kernel = False
     if not args.no_kernel:
         try:
-            from coda_kernels import diff_epilogue, is_available, diagnose
+            from coda_kernels import diff_epilogue, diff_sub_only, is_available, diagnose
             has_kernel = is_available()
             print(f"Fused kernel: {'LOADED' if has_kernel else 'FALLBACK (not compiled)'}")
             if not has_kernel:
@@ -85,7 +85,7 @@ def main():
         print("Fused kernel: SKIPPED (--no-kernel)")
 
     if not has_kernel:
-        from coda_kernels import diff_epilogue  # fallback mode
+        from coda_kernels import diff_epilogue, diff_sub_only  # fallback mode
 
     # ---------------------------------------------------------------------------
     # Configs matching real CoDA-GQA-L usage
@@ -104,11 +104,11 @@ def main():
     ]
 
     # ---------------------------------------------------------------------------
-    # Correctness
+    # Correctness: full epilogue (subtract + RMSNorm + weight)
     # ---------------------------------------------------------------------------
 
     print("\n" + "=" * 70)
-    print("CORRECTNESS")
+    print("CORRECTNESS: diff_epilogue (subtract + RMSNorm + weight)")
     print("=" * 70)
 
     for name, B, H, Lq, Dh, dtype in configs:
@@ -129,11 +129,38 @@ def main():
         print(f"  {name:20s}  max={max_diff:.2e}  mean={mean_diff:.2e}  [{status}]")
 
     # ---------------------------------------------------------------------------
-    # Throughput
+    # Correctness: subtract-only (identity head norm)
     # ---------------------------------------------------------------------------
 
     print("\n" + "=" * 70)
-    print("THROUGHPUT (median ms)")
+    print("CORRECTNESS: diff_sub_only (identity mode)")
+    print("=" * 70)
+
+    def diff_sub_pytorch(out_sig, out_noise, lam):
+        return out_sig - lam * out_noise
+
+    for name, B, H, Lq, Dh, dtype in configs:
+        torch.manual_seed(42)
+        out_sig   = torch.randn(B, H, Lq, Dh, device=device, dtype=dtype)
+        out_noise = torch.randn(B, H, Lq, Dh, device=device, dtype=dtype)
+        lam       = torch.sigmoid(torch.randn(B, H, Lq, 1, device=device, dtype=dtype))
+
+        ref = diff_sub_pytorch(out_sig, out_noise, lam)
+        fused = diff_sub_only(out_sig, out_noise, lam)
+
+        max_diff = (ref - fused).abs().max().item()
+        mean_diff = (ref - fused).abs().mean().item()
+
+        tol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-5
+        status = "PASS" if max_diff < tol else "FAIL"
+        print(f"  {name:20s}  max={max_diff:.2e}  mean={mean_diff:.2e}  [{status}]")
+
+    # ---------------------------------------------------------------------------
+    # Throughput: full epilogue
+    # ---------------------------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("THROUGHPUT: diff_epilogue (median ms)")
     print("=" * 70)
     print(f"  {'Config':20s} {'PyTorch':>10s} {'Fused':>10s} {'Speedup':>8s}  {'Rows':>8s}")
     print("  " + "-" * 62)
@@ -149,6 +176,30 @@ def main():
 
         t_ref = benchmark(diff_epilogue_pytorch, out_sig, out_noise, lam, weight)
         t_fused = benchmark(diff_epilogue, out_sig, out_noise, lam, weight)
+
+        speedup = t_ref / t_fused if t_fused > 0 else float('inf')
+        print(f"  {name:20s} {t_ref:8.4f}ms {t_fused:8.4f}ms {speedup:7.2f}x  {rows:>8d}")
+
+    # ---------------------------------------------------------------------------
+    # Throughput: subtract-only (identity mode, used by Mistral/Llama)
+    # ---------------------------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("THROUGHPUT: diff_sub_only (median ms)")
+    print("=" * 70)
+    print(f"  {'Config':20s} {'PyTorch':>10s} {'Fused':>10s} {'Speedup':>8s}  {'Rows':>8s}")
+    print("  " + "-" * 62)
+
+    for name, B, H, Lq, Dh, dtype in configs:
+        torch.manual_seed(42)
+        out_sig   = torch.randn(B, H, Lq, Dh, device=device, dtype=dtype)
+        out_noise = torch.randn(B, H, Lq, Dh, device=device, dtype=dtype)
+        lam       = torch.sigmoid(torch.randn(B, H, Lq, 1, device=device, dtype=dtype))
+
+        rows = B * H * Lq
+
+        t_ref = benchmark(diff_sub_pytorch, out_sig, out_noise, lam)
+        t_fused = benchmark(diff_sub_only, out_sig, out_noise, lam)
 
         speedup = t_ref / t_fused if t_fused > 0 else float('inf')
         print(f"  {name:20s} {t_ref:8.4f}ms {t_fused:8.4f}ms {speedup:7.2f}x  {rows:>8d}")

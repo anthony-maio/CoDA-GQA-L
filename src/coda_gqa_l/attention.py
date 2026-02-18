@@ -34,9 +34,15 @@ from .primitives import (
 )
 from .state import CoDAGQALandmarkStatePerf2
 
-# Optional fused kernel: auto-detected, falls back to unfused PyTorch.
+# Optional fused kernels: auto-detected, falls back to unfused PyTorch.
+# diff_epilogue: subtract + RMSNorm + weight (head_norm_mode="full")
+# diff_sub_only: subtract only (head_norm_mode="identity")
 try:
-    from coda_kernels import diff_epilogue as _fused_diff_epilogue, is_available as _kernel_available
+    from coda_kernels import (
+        diff_epilogue as _fused_diff_epilogue,
+        diff_sub_only as _fused_diff_sub_only,
+        is_available as _kernel_available,
+    )
     _HAS_FUSED_EPILOGUE = _kernel_available()
 except ImportError:
     _HAS_FUSED_EPILOGUE = False
@@ -343,17 +349,19 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         out_sig = out_cat[:, :H, :, :]
         out_noise = out_cat[:, H:, :, :]
 
-        # Fused path: subtract + RMSNorm + weight in one CUDA kernel pass.
+        # Fused path: CUDA kernel avoids intermediate tensor allocations.
         # Falls back to unfused PyTorch when kernel is not compiled.
-        if (
-            _HAS_FUSED_EPILOGUE
-            and self.head_norm_mode == "full"
-            and out_sig.is_cuda
-        ):
-            out = _fused_diff_epilogue(
-                out_sig.contiguous(), out_noise.contiguous(),
-                lam, self.head_norm.weight, eps=self.head_norm.eps,
-            )
+        if _HAS_FUSED_EPILOGUE and out_sig.is_cuda:
+            if self.head_norm_mode == "full":
+                out = _fused_diff_epilogue(
+                    out_sig.contiguous(), out_noise.contiguous(),
+                    lam, self.head_norm.weight, eps=self.head_norm.eps,
+                )
+            else:
+                # identity mode: just fused subtract (no RMSNorm)
+                out = _fused_diff_sub_only(
+                    out_sig.contiguous(), out_noise.contiguous(), lam,
+                )
         else:
             out = out_sig - lam * out_noise
             out = self.head_norm(out)
