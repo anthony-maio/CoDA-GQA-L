@@ -76,9 +76,8 @@ def _diff_flash_attn_fwd_kernel(
     q_tile = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)        # (BLOCK_M, HEAD_DIM)
     qn_tile = tl.load(qn_ptrs, mask=mask_m[:, None], other=0.0)      # (BLOCK_M, HEAD_DIM)
 
-    # Scale Q upfront
-    q_tile = q_tile * sm_scale
-    qn_tile = qn_tile * sm_scale
+    # NOTE: sm_scale is applied after the dot product (not here) to avoid
+    # promoting Q from bf16/fp16 to fp32 which would cause tl.dot dtype mismatch.
 
     # --- Load lambda ---
     lam_ptrs = LAM + off_b * stride_lb + off_h * stride_lh + offs_m * stride_ll
@@ -127,11 +126,11 @@ def _diff_flash_attn_fwd_kernel(
         k_ptrs = K + off_b * stride_kb + off_h_kv * stride_kh + offs_kv[:, None] * stride_kl + offs_d[None, :] * stride_kd
         k_tile = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)  # (BLOCK_N, HEAD_DIM)
 
-        # QK^T for both streams
+        # QK^T for both streams, scaled after the dot to stay in input dtype
         # q_tile: (BLOCK_M, HEAD_DIM), k_tile: (BLOCK_N, HEAD_DIM)
         # -> qk: (BLOCK_M, BLOCK_N)
-        qk_s = tl.dot(q_tile, tl.trans(k_tile))
-        qk_n = tl.dot(qn_tile, tl.trans(k_tile))
+        qk_s = tl.dot(q_tile, tl.trans(k_tile)) * sm_scale
+        qk_n = tl.dot(qn_tile, tl.trans(k_tile)) * sm_scale
 
         # Apply causal mask
         if IS_CAUSAL:
