@@ -508,9 +508,17 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
 
             # Dense packing: when B==1 and there are invalid prefix slots,
             # pack only valid prefix slots to eliminate unnecessary keys.
+            #
+            # Disabled during training: memory bank scatter ops are
+            # non-deterministic on CUDA (atomic float additions), so the
+            # number of valid slots can differ between gradient-checkpointing's
+            # forward and recompute passes, producing different tensor shapes
+            # and triggering CheckpointError.  With packing off, k_all is
+            # always (B, Hkv, Lbuf+blk, Dh) regardless of bank state.
             use_packing = (
                 B == 1
                 and self.mask_unused_memory
+                and not self.training
                 and not bool(allowed_prev[0].all())
             )
 
@@ -541,11 +549,15 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
                 # No prefix → square attention → is_causal=True is correct.
                 attn_mask = None
                 is_causal = True
-            elif _causal_lr_bias is not None and B == 1:
+            elif (
+                _causal_lr_bias is not None
+                and B == 1
+                and (use_packing or bool(allowed_prev[0].all()) or not self.mask_unused_memory)
+            ):
                 # PyTorch 2.5+, B==1: lower-right causal bias → FlashAttention.
-                # Safe for B==1: if use_packing removed invalid slots, all
-                # remaining are valid. If not packing, either all slots are
-                # valid (allowed_prev.all()) or mask_unused_memory is off.
+                # Safe when: packing removed invalid slots, all slots are valid,
+                # or unused-memory masking is off.  During training (packing off,
+                # partially-filled banks), fall through to explicit mask below.
                 attn_mask = _causal_lr_bias(blk, Lk_total)
                 is_causal = False
             else:

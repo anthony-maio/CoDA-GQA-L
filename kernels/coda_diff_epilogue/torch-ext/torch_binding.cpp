@@ -211,3 +211,9 @@ TORCH_LIBRARY_IMPL(coda_kernels, CUDA, m) {
     m.impl("diff_epilogue_forward", &diff_epilogue_forward);
     m.impl("diff_sub_only_forward", &diff_sub_only_forward);
 }
+
+// Minimal pybind11 module so the .pyd is importable on Windows.
+// Importing it triggers TORCH_LIBRARY registration above.
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "CoDA fused differential attention epilogue kernels";
+}

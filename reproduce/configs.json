@@ -1,0 +1,59 @@
+{
+  "smoke_test": {
+    "description": "Quick sanity check (~5 min, any GPU)",
+    "commands": [
+      "python benchmarks/eval_llm.py --model HuggingFaceTB/SmolLM2-135M --experiment forward-check --dtype fp32",
+      "python benchmarks/train_coda.py --model HuggingFaceTB/SmolLM2-135M --max-steps 200 --eval-every 100"
+    ]
+  },
+  "table1_cold_swap_ppl": {
+    "description": "Cold-swap perplexity (Table 1) -- no training needed",
+    "commands": [
+      "python benchmarks/eval_llm.py --model HuggingFaceTB/SmolLM2-135M --experiment perplexity --dtype fp32",
+      "python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 --experiment perplexity --dtype fp32"
+    ],
+    "notes": "Use fp32 for cold-swap accuracy. bf16 rounding compounds through 30+ layers."
+  },
+  "table2_finetuned_ppl": {
+    "description": "Fine-tuned perplexity (Table 2) -- requires GPU hours",
+    "train": "python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 --max-steps 2000 --bounded-steps 1000 --bounded-config medium --batch-size 2 --grad-accum 4 --output-dir results/mistral7b_train",
+    "eval": "python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 --experiment perplexity --adapter-weights results/mistral7b_train/best --head-norm-mode identity --dtype bf16"
+  },
+  "table3_throughput": {
+    "description": "Throughput and KV cache memory (Table 3)",
+    "commands": [
+      "python benchmarks/run_suite.py",
+      "python benchmarks/render_tables.py"
+    ]
+  },
+  "ablation_diff_attn": {
+    "description": "Differential attention contribution ablation -- GQA+bounded vs CoDA+bounded (H100 recommended, ~4 hours)",
+    "script": "benchmarks/run_ablation_h100.sh",
+    "notes": "Trains two Mistral-7B configs head-to-head: standard GQA with bounded cache (--no-differential) vs full CoDA with bounded cache. 1200 steps each."
+  },
+  "ablation_memory_banks": {
+    "description": "Memory bank config sweep -- window-only vs tiny vs medium vs large",
+    "command": "python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 --experiment perplexity --bounded-configs window-only,tiny,medium,large --adapter-weights results/mistral7b_train/best --dtype bf16",
+    "notes": "Requires trained adapter weights from table2_finetuned_ppl."
+  },
+  "needle_retention": {
+    "description": "Needle-in-haystack retention (~1 min)",
+    "commands": [
+      "python examples/needle_demo.py",
+      "RUN_LONG=1 python examples/needle_demo.py"
+    ]
+  },
+  "bounded_generation_metrics": {
+    "description": "Memory bank hit rates and fill ratios during generation",
+    "command": "python examples/bounded_generate.py --collect-metrics --max-new-tokens 500"
+  },
+  "eve2_integration": {
+    "description": "Eve-2 MoE integration benchmarks (optional)",
+    "commands": [
+      "python benchmarks/eval_eve.py --experiment forward-check",
+      "python benchmarks/eval_eve.py --experiment perplexity",
+      "python benchmarks/eval_eve.py --experiment needle",
+      "python benchmarks/eval_eve.py --experiment all"
+    ]
+  }
+}
