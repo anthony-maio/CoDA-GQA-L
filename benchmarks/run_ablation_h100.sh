@@ -87,7 +87,6 @@ python benchmarks/train_coda.py \
     --bounded-lr-scale 0.5 \
     --eval-every 200 \
     --save-every 400 \
-    --gradient-checkpointing \
     --output-dir "$RESULTS_DIR/gqa_bounded" \
     2>&1 | tee "$RESULTS_DIR/ablation1_gqa_bounded.log"
 
@@ -115,7 +114,6 @@ python benchmarks/train_coda.py \
     --bounded-lr-scale 0.5 \
     --eval-every 200 \
     --save-every 400 \
-    --gradient-checkpointing \
     --output-dir "$RESULTS_DIR/coda_bounded" \
     2>&1 | tee "$RESULTS_DIR/ablation2_coda_bounded.log"
 
