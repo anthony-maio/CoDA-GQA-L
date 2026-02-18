@@ -104,17 +104,10 @@ def _diff_flash_attn_fwd_kernel(
     else:
         prefix_len = 0
 
-    # Determine KV loop bounds
-    if IS_CAUSAL:
-        # Last valid KV index for this query block
-        kv_bound = tl.minimum(
-            KV_LEN,
-            (pid_m + 1) * BLOCK_M + prefix_len,
-        )
-        # Round up to BLOCK_N
-        n_blocks = tl.cdiv(kv_bound, BLOCK_N)
-    else:
-        n_blocks = tl.cdiv(KV_LEN, BLOCK_N)
+    # Always iterate all KV blocks.  The causal mask inside the loop
+    # handles early-exit semantics; this avoids potential issues with
+    # tl.cdiv on runtime kv_bound values in certain Triton versions.
+    n_blocks = tl.cdiv(KV_LEN, BLOCK_N)
 
     # --- KV tile loop ---
     for block_n in range(0, n_blocks):
@@ -219,10 +212,22 @@ def _diff_flash_fwd(
     else:
         BLOCK_N = 128
 
-    # HEAD_DIM must fit in tile — cap BLOCK_N if needed for register pressure
+    # HEAD_DIM must fit in tile — cap for register pressure
     if HEAD_DIM > 128:
         BLOCK_M = min(BLOCK_M, 64)
         BLOCK_N = min(BLOCK_N, 64)
+
+    # fp32 inputs use 4 bytes/element → 2x shared memory pressure.
+    # Reduce tiles to stay within H100's 228KB shared memory limit.
+    dtype_bytes = q.element_size()
+    if dtype_bytes >= 4:
+        BLOCK_M = min(BLOCK_M, 32)
+        BLOCK_N = min(BLOCK_N, 64)
+
+    # num_stages controls pipelining depth (more stages = more shared memory).
+    # Use 1 stage for large tiles or fp32 to avoid OOM; 2 otherwise.
+    tile_bytes = (BLOCK_M + BLOCK_N) * HEAD_DIM * dtype_bytes * 2  # Q+K rough estimate
+    num_stages = 1 if tile_bytes > 64 * 1024 else 2
 
     # Dummy RMS weight pointer if not applying RMSNorm
     if rms_weight is None:
@@ -254,4 +259,6 @@ def _diff_flash_fwd(
         APPLY_RMS=APPLY_RMS,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        num_stages=num_stages,
+        num_warps=4,
     )
