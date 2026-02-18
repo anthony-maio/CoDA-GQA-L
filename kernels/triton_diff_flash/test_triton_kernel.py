@@ -15,8 +15,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-# Allow running from repo root
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Add kernels/ to path so `import triton_diff_flash` resolves
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from triton_diff_flash import diff_flash_attn, is_available, diagnose
 
 

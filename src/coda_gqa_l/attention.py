@@ -49,12 +49,18 @@ except ImportError:
 
 # Triton fused differential FlashAttention: loads K/V once from HBM,
 # computes both attention streams + differential epilogue in one pass.
+_HAS_TRITON_FLASH = False
 try:
+    import sys as _sys
+    from pathlib import Path as _Path
+    _kernels_dir = str(_Path(__file__).resolve().parent.parent.parent / "kernels")
+    if _kernels_dir not in _sys.path:
+        _sys.path.insert(0, _kernels_dir)
     from triton_diff_flash import diff_flash_attn as _triton_diff_flash
     from triton_diff_flash import is_available as _triton_flash_available
     _HAS_TRITON_FLASH = _triton_flash_available()
 except ImportError:
-    _HAS_TRITON_FLASH = False
+    pass
 
 # PyTorch 2.5+: lower-right causal bias enables FlashAttention for prefix+block
 # attention (Lq < Lk) without needing an explicit boolean mask.
