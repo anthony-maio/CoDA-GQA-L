@@ -132,17 +132,17 @@ def _diff_flash_attn_fwd_kernel(
         qk_s = tl.dot(q_tile, tl.trans(k_tile)) * sm_scale
         qk_n = tl.dot(qn_tile, tl.trans(k_tile)) * sm_scale
 
-        # Apply causal mask
+        # Apply causal mask + OOB KV mask
         if IS_CAUSAL:
             # q_pos = offs_m + prefix_len, k_pos = offs_kv
-            # valid where q_pos >= k_pos
+            # valid where q_pos >= k_pos AND k_pos < KV_LEN
             causal_mask = (offs_m[:, None] + prefix_len) >= offs_kv[None, :]
-            qk_s = tl.where(causal_mask, qk_s, float("-inf"))
-            qk_n = tl.where(causal_mask, qk_n, float("-inf"))
-
-        # OOB KV mask
-        qk_s = tl.where(mask_n[None, :], qk_s, float("-inf"))
-        qk_n = tl.where(mask_n[None, :], qk_n, float("-inf"))
+            valid = causal_mask & mask_n[None, :]
+            qk_s = tl.where(valid, qk_s, float("-inf"))
+            qk_n = tl.where(valid, qk_n, float("-inf"))
+        else:
+            qk_s = tl.where(mask_n[None, :], qk_s, float("-inf"))
+            qk_n = tl.where(mask_n[None, :], qk_n, float("-inf"))
 
         # Load V tile (shared)
         v_ptrs = V + off_b * stride_vb + off_h_kv * stride_vh + offs_kv[:, None] * stride_vl + offs_d[None, :] * stride_vd
@@ -165,8 +165,8 @@ def _diff_flash_attn_fwd_kernel(
         m_n = m_n_new
 
     # --- Finalize: divide by sum-of-exp ---
-    acc_s = acc_s / l_s[:, None]
-    acc_n = acc_n / l_n[:, None]
+    acc_s = acc_s / (l_s[:, None] + 1e-10)
+    acc_n = acc_n / (l_n[:, None] + 1e-10)
 
     # --- Differential epilogue ---
     diff = acc_s - lam_tile[:, None] * acc_n
@@ -175,7 +175,7 @@ def _diff_flash_attn_fwd_kernel(
     if APPLY_RMS:
         # var = mean(diff^2) over head_dim
         var = tl.sum(diff * diff, axis=1) / HEAD_DIM
-        rstd = 1.0 / tl.sqrt(var + eps)
+        rstd = tl.math.rsqrt(var + eps)
         diff = diff * rstd[:, None]
         # Load and apply RMSNorm weight
         rms_w = tl.load(RMS_W + offs_d)  # (HEAD_DIM,)
