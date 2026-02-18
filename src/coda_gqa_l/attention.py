@@ -487,24 +487,44 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
 
         Lprev_fixed = self.Lbuf
 
+        # --- Hoisted: compute projections and RoPE once for the full seq ---
+        # These are all sequence-global (same weight matrices for every chunk)
+        # and independent of memory bank state.
+        pos0_initial = int(state.pos)
+
+        q_seq = self._project_q(x_seq)             # (B, H, L, Dh)
+        k_raw_seq, v_seq = self._project_kv_raw(x_seq)  # (B, Hkv, L, Dh) each
+        g_seq = self._write_gate(x_seq)             # (B, L)
+
+        cos_rope, sin_rope = self.rope(
+            seq_len=L, offset=pos0_initial, device=device, dtype=dtype,
+        )  # (L, Dh//2)
+        q_seq = apply_rope(q_seq, cos_rope, sin_rope, interleaved=self.rope_interleaved)
+        k_seq = apply_rope(k_raw_seq, cos_rope, sin_rope, interleaved=self.rope_interleaved)
+
+        # Lambda projection: per-token scalar, no position dependence.
+        lam_seq = torch.sigmoid(self.lambda_proj(x_seq))  # (B, L, H)
+        lam_seq = lam_seq.transpose(1, 2).unsqueeze(-1)   # (B, H, L, 1)
+
+        # Orthogonal rotation parameters (constant across tokens).
+        cos_t = torch.cos(self.theta).to(device=device, dtype=dtype)
+        sin_t = torch.sin(self.theta).to(device=device, dtype=dtype)
+
+        # --- Chunk loop: only slicing, SDPA, and bank writes ---
         t = 0
         while t < L:
             blk = min(int(block_size), L - t)
-            x_blk = x_seq[:, t:t+blk, :]
-            pos0 = int(state.pos)
+            pos0 = pos0_initial + t
+
+            q = q_seq[:, :, t:t+blk, :]
+            k_blk = k_seq[:, :, t:t+blk, :]
+            v_blk = v_seq[:, :, t:t+blk, :]
+            g_blk = g_seq[:, t:t+blk]
+            lam = lam_seq[:, :, t:t+blk, :]
 
             k_prev = state.k_buf
             v_prev = state.v_buf
             allowed_prev = state.allowed
-
-            q = self._project_q(x_blk)
-            k_raw, v_blk = self._project_kv_raw(x_blk)
-            g_blk = self._write_gate(x_blk)
-
-            cos_q, sin_q = self.rope(seq_len=blk, offset=pos0, device=device, dtype=dtype)
-            q = apply_rope(q, cos_q, sin_q, interleaved=self.rope_interleaved)
-            cos_k, sin_k = self.rope(seq_len=blk, offset=pos0, device=device, dtype=dtype)
-            k_blk = apply_rope(k_raw, cos_k, sin_k, interleaved=self.rope_interleaved)
 
             # Dense packing: when B==1 and there are invalid prefix slots,
             # pack only valid prefix slots to eliminate unnecessary keys.
@@ -575,11 +595,7 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
                     attn_mask = causal.view(1, 1, blk, Lk_total) & allowed[:, None, None, :]
                     is_causal = False
 
-            cos_t = torch.cos(self.theta).to(device=device, dtype=dtype)
-            sin_t = torch.sin(self.theta).to(device=device, dtype=dtype)
             q_noise = _apply_pairwise_rotation(q, cos_t, sin_t)
-
-            lam = torch.sigmoid(self.lambda_proj(x_blk)).transpose(1, 2).unsqueeze(-1)
 
             out_h = self._sdpa_stacked_two_stream(
                 q=q, q_noise=q_noise, k=k_all, v=v_all,

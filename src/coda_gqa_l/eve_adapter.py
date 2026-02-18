@@ -69,7 +69,7 @@ class EveCoDAAdapter(nn.Module):
         window: int = 256,
         num_landmarks_exact: int = 64,
         num_landmarks_summary: int = 64,
-        block_size: int = 256,
+        block_size: int = 1024,
         **coda_kwargs,
     ):
         """
