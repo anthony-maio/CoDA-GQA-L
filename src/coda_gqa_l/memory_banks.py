@@ -14,6 +14,15 @@ import torch.nn.functional as F
 
 from .state import CoDAGQALandmarkStatePerf2
 
+# Triton fused exact-bank routing: scores + classifies + assigns LRU slots
+# in a single kernel pass.  Falls back to PyTorch when unavailable.
+try:
+    from triton_bank_routing import exact_bank_route as _triton_exact_route
+    from triton_bank_routing import is_available as _triton_route_available
+    _HAS_TRITON_ROUTE = _triton_route_available()
+except ImportError:
+    _HAS_TRITON_ROUTE = False
+
 
 class MemoryBankMixin:
     """Memory bank update methods, mixed into CoDAGQALandmarkPerf2.
@@ -49,12 +58,6 @@ class MemoryBankMixin:
     def _new_scratch(B: int, Hkv: int, Me: int, Ms: int, Dh: int, device: torch.device, dtype: torch.dtype) -> dict:
         """Allocate a fresh set of scratch buffers."""
         return {
-            'exact_sum_k': torch.zeros(B, Hkv, Me, Dh, device=device, dtype=dtype),
-            'exact_sum_v': torch.zeros(B, Hkv, Me, Dh, device=device, dtype=dtype),
-            'exact_upd': torch.zeros(B, Me, device=device, dtype=dtype),
-            'exact_max_score': torch.empty(B, Me, device=device, dtype=torch.float32),
-            'exact_max_pos': torch.empty(B, Me, device=device, dtype=torch.int64),
-            'exact_pos_slot': torch.zeros(B, Me, device=device, dtype=torch.int64),
             'sum_count': torch.zeros(B, Ms, device=device, dtype=dtype),
             'sum_sum_k': torch.zeros(B, Hkv, Ms, Dh, device=device, dtype=dtype),
             'sum_sum_v': torch.zeros(B, Hkv, Ms, Dh, device=device, dtype=dtype),
@@ -546,15 +549,16 @@ class MemoryBankMixin:
         """Update exact landmark bank with evicted token candidates.
 
         V-routing: cosine similarity uses Values (RoPE-free) for semantic
-        matching.  Avoids CPU-GPU sync points on the hot path.  Uses scratch
-        buffers and cached normalized memory values.
+        matching.  Avoids CPU-GPU sync points on the hot path.  Uses direct
+        slot writes instead of scatter-based winner-take-all to reduce CUDA
+        kernel launch overhead.  Selective normalization updates only changed
+        slots.
         """
         if self.Me == 0:
             return
         B, Hkv, T, Dh = k_sel.shape
         Me = self.Me
         device = k_sel.device
-        sc = self._get_scratch(B, Hkv, Dh, device, k_sel.dtype)
 
         mem_k, mem_v, used = self._view_exact(state)
         # Clone views when gradients flow through bank updates: the
@@ -566,99 +570,121 @@ class MemoryBankMixin:
             mem_v = mem_v.clone()
         last = state.mem_last_exact
 
-        if self.write_policy != "none":
-            keep_tok = gate_sel >= self.write_gate_threshold_exact
-        else:
-            keep_tok = torch.ones((B, T), device=device, dtype=torch.bool)
-
-        # V-routing: cosine similarity on Values (RoPE-free) for semantic matching.
+        # V-routing: normalize candidates if not already done.
         if v_sel_norm is None:
             v_sel_norm = F.normalize(v_sel, dim=-1, eps=1e-6)
         mem_n = state._exact_v_norm  # cached; updated on writes
-        scores_h = torch.matmul(
-            v_sel_norm.reshape(B * Hkv, T, Dh),
-            mem_n.reshape(B * Hkv, Me, Dh).transpose(1, 2),
-        ).view(B, Hkv, T, Me)
-        scores = scores_h.mean(dim=1)
 
-        scores.masked_fill_(~used[:, None, :], -1e9)
-        best_score, best_idx = scores.max(dim=-1)
-        any_used = used.any(dim=-1)
+        # =================================================================
+        # Routing: score + classify + LRU assign
+        # =================================================================
+        # Fast path: Triton kernel fuses matmul, mean, max, classification,
+        # LRU victim selection, and sequential state update into 1 launch.
+        # Fallback: pure-PyTorch reference path (~15 kernel launches).
+        can_use_triton = (
+            _HAS_TRITON_ROUTE
+            and not self.training
+            and v_sel_norm.is_cuda
+        )
 
-        novel = (~any_used[:, None]) | (best_score < self.exact_novelty_threshold)
-        hit = any_used[:, None] & (best_score >= self.exact_match_threshold)
-
-        novel_keep = novel & keep_tok
-
-        rank_key = last.clone()
-        rank_key[~used] = -(2**62)
-        lru_k = min(T, Me)
-        _, lru_slots = torch.topk(rank_key, k=lru_k, dim=1, largest=False, sorted=True)
-
-        novel_rank = novel_keep.to(torch.int64).cumsum(dim=1) - 1
-        novel_cap = novel_keep & (novel_rank < Me)
-
-        rank_clamped = novel_rank.clamp(min=0, max=max(lru_k - 1, 0))
-        slot_assigned = lru_slots.gather(1, rank_clamped)
-
-        idx_tok = torch.where(novel_cap, slot_assigned, best_idx)
-
-        touch_tok = keep_tok & (~novel | novel_cap)
-
-        if self.exact_refresh_on_hit:
-            overwrite_tok = keep_tok & (novel_cap | hit)
+        if can_use_triton:
+            idx_tok, overwrite_tok, touch_tok, last = _triton_exact_route(
+                v_sel_norm, mem_n, used, last, gate_sel.float(), pos_sel,
+                tau_gate=self.write_gate_threshold_exact if self.write_policy != "none" else -1e30,
+                tau_match=self.exact_match_threshold,
+                tau_novel=self.exact_novelty_threshold,
+                refresh_on_hit=self.exact_refresh_on_hit,
+            )
+            state.mem_last_exact = last
         else:
-            overwrite_tok = novel_cap
+            # --- PyTorch fallback: scoring + classification + LRU ---
+            if self.write_policy != "none":
+                keep_tok = gate_sel >= self.write_gate_threshold_exact
+            else:
+                keep_tok = torch.ones((B, T), device=device, dtype=torch.bool)
 
-        # LRU timestamp update (scratch buffer: max_pos)
-        pos_touch = torch.where(touch_tok, pos_sel, torch.full_like(pos_sel, -1))
-        max_pos = sc['exact_max_pos']
-        max_pos.fill_(-1)
-        max_pos.scatter_reduce_(1, idx_tok, pos_touch, reduce="amax", include_self=True)
-        last = torch.where(max_pos >= 0, max_pos, last)
-        state.mem_last_exact = last
+            scores_h = torch.matmul(
+                v_sel_norm.reshape(B * Hkv, T, Dh),
+                mem_n.reshape(B * Hkv, Me, Dh).transpose(1, 2),
+            ).view(B, Hkv, T, Me)
+            scores = scores_h.mean(dim=1)
 
-        # Winner-take-all per slot (scratch buffer: max_score)
-        tie = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(0) * 1e-6
-        score_tok = gate_sel.float() + tie
-        neginf = torch.tensor(-float("inf"), device=device, dtype=torch.float32)
-        score_tok = torch.where(overwrite_tok, score_tok, neginf)
+            scores.masked_fill_(~used[:, None, :], -1e9)
+            best_score, best_idx = scores.max(dim=-1)
+            any_used = used.any(dim=-1)
 
-        max_score = sc['exact_max_score']
-        max_score.fill_(-float("inf"))
-        max_score.scatter_reduce_(1, idx_tok, score_tok, reduce="amax", include_self=True)
-        winner = overwrite_tok & (score_tok == max_score.gather(1, idx_tok))
+            novel = (~any_used[:, None]) | (best_score < self.exact_novelty_threshold)
+            hit = any_used[:, None] & (best_score >= self.exact_match_threshold)
+            novel_keep = novel & keep_tok
 
-        # KV scatter (scratch buffers: sum_k, sum_v, upd, pos_slot)
+            rank_key = last.clone()
+            rank_key[~used] = -(2**62)
+            lru_k = min(T, Me)
+            _, lru_slots = torch.topk(rank_key, k=lru_k, dim=1, largest=False, sorted=True)
+
+            novel_rank = novel_keep.to(torch.int64).cumsum(dim=1) - 1
+            novel_cap = novel_keep & (novel_rank < Me)
+
+            rank_clamped = novel_rank.clamp(min=0, max=max(lru_k - 1, 0))
+            slot_assigned = lru_slots.gather(1, rank_clamped)
+
+            idx_tok = torch.where(novel_cap, slot_assigned, best_idx)
+            touch_tok = keep_tok & (~novel | novel_cap)
+
+            if self.exact_refresh_on_hit:
+                overwrite_tok = keep_tok & (novel_cap | hit)
+            else:
+                overwrite_tok = novel_cap
+
+            # LRU timestamp: update for any touched candidate (hit or novel).
+            # scatter_reduce_ amax handles duplicate idx_tok correctly:
+            # True wins over False for touch_mask, max position wins for timestamps.
+            touch_mask_int = torch.zeros((B, Me), device=device, dtype=torch.int8)
+            touch_mask_int.scatter_reduce_(
+                1, idx_tok, touch_tok.to(torch.int8), reduce="amax",
+                include_self=True,
+            )
+            touch_mask = touch_mask_int.to(torch.bool)
+            pos_for_scatter = torch.where(
+                touch_tok, pos_sel, torch.full_like(pos_sel, -(2**62)),
+            )
+            pos_vals = torch.full((B, Me), -(2**62), device=device, dtype=pos_sel.dtype)
+            pos_vals.scatter_reduce_(
+                1, idx_tok, pos_for_scatter, reduce="amax",
+                include_self=True,
+            )
+            last = torch.where(touch_mask, pos_vals, last)
+            state.mem_last_exact = last
+
+        # =================================================================
+        # Scatter writeback: write K/V for overwrite candidates
+        # =================================================================
+        # Delta-based scatter_add: non-overwrite tokens contribute zero
+        # delta, so they cannot revert an overwrite on a shared slot.
+        # Fully out-of-place to avoid autograd version conflicts when
+        # detach_evicted=False (gather saves mem_k; in-place scatter_
+        # would increment its version and break backward).
         idx_exp = idx_tok.unsqueeze(1).unsqueeze(-1).expand(B, Hkv, T, Dh)
-        w4 = winner.to(dtype=mem_k.dtype, device=device).view(B, 1, T, 1)
-        weighted_k = k_sel * w4
-        weighted_v = v_sel * w4
+        ow = overwrite_tok.to(dtype=mem_k.dtype, device=device).view(B, 1, T, 1)
 
-        sum_k = sc['exact_sum_k']
-        sum_v = sc['exact_sum_v']
-        sum_k.zero_()
-        sum_v.zero_()
-        sum_k.scatter_add_(2, idx_exp, weighted_k)
-        sum_v.scatter_add_(2, idx_exp, weighted_v)
+        old_k = mem_k.gather(2, idx_exp)
+        old_v = mem_v.gather(2, idx_exp)
+        delta_k = ow * (k_sel - old_k)
+        delta_v = ow * (v_sel - old_v)
+        contrib_k = torch.zeros_like(mem_k).scatter_add_(2, idx_exp, delta_k)
+        contrib_v = torch.zeros_like(mem_v).scatter_add_(2, idx_exp, delta_v)
+        mem_k = mem_k + contrib_k
+        mem_v = mem_v + contrib_v
 
-        upd = sc['exact_upd']
-        upd.zero_()
-        upd.scatter_add_(1, idx_tok, winner.to(dtype=mem_k.dtype, device=device))
-        slot_updated = upd > 0
-
-        pos_vals = pos_sel * winner.to(dtype=torch.int64)
-        pos_slot = sc['exact_pos_slot']
-        pos_slot.zero_()
-        pos_slot.scatter_add_(1, idx_tok, pos_vals)
-
-        slot4 = slot_updated.view(B, 1, Me, 1)
-        mem_k = torch.where(slot4, sum_k, mem_k)
-        mem_v = torch.where(slot4, sum_v, mem_v)
-        used = used | slot_updated
-        last = state.mem_last_exact
-        last = torch.where(slot_updated, pos_slot, last)
-        state.mem_last_exact = last
+        # Mark overwritten slots as used.  scatter_reduce_ amax handles
+        # duplicate idx_tok correctly (True wins over False).
+        slot_mask_int = torch.zeros((B, Me), device=device, dtype=torch.int8)
+        slot_mask_int.scatter_reduce_(
+            1, idx_tok, overwrite_tok.to(torch.int8), reduce="amax",
+            include_self=True,
+        )
+        slot_mask = slot_mask_int.to(torch.bool)
+        used = used | slot_mask
 
         s = self.window
         e = self.window + Me
@@ -666,19 +692,27 @@ class MemoryBankMixin:
         state.v_buf[:, :, s:e, :] = mem_v
         state.allowed[:, s:e] = used
 
-        # Update V-routing norm cache for overwritten slots
-        state._exact_v_norm = F.normalize(mem_v, dim=-1, eps=1e-6)
+        # Selective V-routing norm cache update: only re-normalize slots that
+        # were actually overwritten, not the entire bank.  For typical updates
+        # (1-2 slots out of Me=64) this reduces normalize volume by ~30-60x.
+        # No .any() guard — empty updated_slots is a no-op without CPU-GPU sync.
+        updated_slots = slot_mask.any(dim=0).nonzero(as_tuple=True)[0]
+        state._exact_v_norm[:, :, updated_slots, :] = F.normalize(
+            mem_v[:, :, updated_slots, :], dim=-1, eps=1e-6
+        )
 
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:
             m = state.metrics
-            m["exact_inserts"] += int(novel_cap.sum().item())
-            m["exact_hits"] += int((hit & keep_tok).sum().item())
             m["exact_overwrites"] += int(overwrite_tok.sum().item())
-            if self.write_policy != "none":
-                m["tokens_gated_out"] += int((~keep_tok).sum().item())
             if self.Me > 0:
                 m["exact_fill_ratio"] = float(used.any(dim=0).float().mean().item())
+            if not can_use_triton:
+                # Detailed breakdown only available from PyTorch fallback path
+                m["exact_inserts"] += int(novel_cap.sum().item())
+                m["exact_hits"] += int((hit & keep_tok).sum().item())
+                if self.write_policy != "none":
+                    m["tokens_gated_out"] += int((~keep_tok).sum().item())
 
     # ------------------------------------------------------------------
     # Summary bank update (block, prefill path)
@@ -772,8 +806,13 @@ class MemoryBankMixin:
         state.v_buf[:, :, s:e, :] = mem_v
         state.allowed[:, s:e] = used
 
-        # Update LF-K routing norm cache for EMA-blended slots
-        state._sum_lf_k_norm = F.normalize(mem_k[..., lf:], dim=-1, eps=1e-6)
+        # Selective LF-K routing norm cache update: only re-normalize slots
+        # that received EMA contributions, not the entire bank.
+        active_slots = (count > 0).any(dim=0).nonzero(as_tuple=True)[0]
+        if active_slots.numel() > 0:
+            state._sum_lf_k_norm[:, :, active_slots, :] = F.normalize(
+                mem_k[:, :, active_slots, lf:], dim=-1, eps=1e-6
+            )
 
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:
