@@ -636,28 +636,54 @@ class MemoryBankMixin:
             else:
                 overwrite_tok = novel_cap
 
-            # LRU timestamp: update for any touched candidate (hit or novel)
-            touch_mask = torch.zeros((B, Me), device=device, dtype=torch.bool)
-            touch_mask.scatter_(1, idx_tok, touch_tok)
-            pos_for_scatter = torch.where(touch_tok, pos_sel, torch.full_like(pos_sel, -1))
-            pos_vals = torch.full((B, Me), -1, device=device, dtype=pos_sel.dtype)
-            pos_vals.scatter_(1, idx_tok, pos_for_scatter)
-            last = torch.where(touch_mask & (pos_vals >= 0), pos_vals, last)
+            # LRU timestamp: update for any touched candidate (hit or novel).
+            # scatter_reduce_ amax handles duplicate idx_tok correctly:
+            # True wins over False for touch_mask, max position wins for timestamps.
+            touch_mask_int = torch.zeros((B, Me), device=device, dtype=torch.int8)
+            touch_mask_int.scatter_reduce_(
+                1, idx_tok, touch_tok.to(torch.int8), reduce="amax",
+                include_self=True,
+            )
+            touch_mask = touch_mask_int.to(torch.bool)
+            pos_for_scatter = torch.where(
+                touch_tok, pos_sel, torch.full_like(pos_sel, -(2**62)),
+            )
+            pos_vals = torch.full((B, Me), -(2**62), device=device, dtype=pos_sel.dtype)
+            pos_vals.scatter_reduce_(
+                1, idx_tok, pos_for_scatter, reduce="amax",
+                include_self=True,
+            )
+            last = torch.where(touch_mask, pos_vals, last)
             state.mem_last_exact = last
 
         # =================================================================
         # Scatter writeback: write K/V for overwrite candidates
         # =================================================================
+        # Delta-based scatter_add: non-overwrite tokens contribute zero
+        # delta, so they cannot revert an overwrite on a shared slot.
+        # Fully out-of-place to avoid autograd version conflicts when
+        # detach_evicted=False (gather saves mem_k; in-place scatter_
+        # would increment its version and break backward).
         idx_exp = idx_tok.unsqueeze(1).unsqueeze(-1).expand(B, Hkv, T, Dh)
         ow = overwrite_tok.to(dtype=mem_k.dtype, device=device).view(B, 1, T, 1)
 
         old_k = mem_k.gather(2, idx_exp)
         old_v = mem_v.gather(2, idx_exp)
-        mem_k.scatter_(2, idx_exp, ow * k_sel + (1.0 - ow) * old_k)
-        mem_v.scatter_(2, idx_exp, ow * v_sel + (1.0 - ow) * old_v)
+        delta_k = ow * (k_sel - old_k)
+        delta_v = ow * (v_sel - old_v)
+        contrib_k = torch.zeros_like(mem_k).scatter_add_(2, idx_exp, delta_k)
+        contrib_v = torch.zeros_like(mem_v).scatter_add_(2, idx_exp, delta_v)
+        mem_k = mem_k + contrib_k
+        mem_v = mem_v + contrib_v
 
-        slot_mask = torch.zeros((B, Me), device=device, dtype=torch.bool)
-        slot_mask.scatter_(1, idx_tok, overwrite_tok)
+        # Mark overwritten slots as used.  scatter_reduce_ amax handles
+        # duplicate idx_tok correctly (True wins over False).
+        slot_mask_int = torch.zeros((B, Me), device=device, dtype=torch.int8)
+        slot_mask_int.scatter_reduce_(
+            1, idx_tok, overwrite_tok.to(torch.int8), reduce="amax",
+            include_self=True,
+        )
+        slot_mask = slot_mask_int.to(torch.bool)
         used = used | slot_mask
 
         s = self.window
@@ -669,11 +695,11 @@ class MemoryBankMixin:
         # Selective V-routing norm cache update: only re-normalize slots that
         # were actually overwritten, not the entire bank.  For typical updates
         # (1-2 slots out of Me=64) this reduces normalize volume by ~30-60x.
-        if slot_mask.any():
-            updated_slots = slot_mask.any(dim=0).nonzero(as_tuple=True)[0]
-            state._exact_v_norm[:, :, updated_slots, :] = F.normalize(
-                mem_v[:, :, updated_slots, :], dim=-1, eps=1e-6
-            )
+        # No .any() guard — empty updated_slots is a no-op without CPU-GPU sync.
+        updated_slots = slot_mask.any(dim=0).nonzero(as_tuple=True)[0]
+        state._exact_v_norm[:, :, updated_slots, :] = F.normalize(
+            mem_v[:, :, updated_slots, :], dim=-1, eps=1e-6
+        )
 
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:
