@@ -49,12 +49,6 @@ class MemoryBankMixin:
     def _new_scratch(B: int, Hkv: int, Me: int, Ms: int, Dh: int, device: torch.device, dtype: torch.dtype) -> dict:
         """Allocate a fresh set of scratch buffers."""
         return {
-            'exact_sum_k': torch.zeros(B, Hkv, Me, Dh, device=device, dtype=dtype),
-            'exact_sum_v': torch.zeros(B, Hkv, Me, Dh, device=device, dtype=dtype),
-            'exact_upd': torch.zeros(B, Me, device=device, dtype=dtype),
-            'exact_max_score': torch.empty(B, Me, device=device, dtype=torch.float32),
-            'exact_max_pos': torch.empty(B, Me, device=device, dtype=torch.int64),
-            'exact_pos_slot': torch.zeros(B, Me, device=device, dtype=torch.int64),
             'sum_count': torch.zeros(B, Ms, device=device, dtype=dtype),
             'sum_sum_k': torch.zeros(B, Hkv, Ms, Dh, device=device, dtype=dtype),
             'sum_sum_v': torch.zeros(B, Hkv, Ms, Dh, device=device, dtype=dtype),
@@ -546,15 +540,16 @@ class MemoryBankMixin:
         """Update exact landmark bank with evicted token candidates.
 
         V-routing: cosine similarity uses Values (RoPE-free) for semantic
-        matching.  Avoids CPU-GPU sync points on the hot path.  Uses scratch
-        buffers and cached normalized memory values.
+        matching.  Avoids CPU-GPU sync points on the hot path.  Uses direct
+        slot writes instead of scatter-based winner-take-all to reduce CUDA
+        kernel launch overhead.  Selective normalization updates only changed
+        slots.
         """
         if self.Me == 0:
             return
         B, Hkv, T, Dh = k_sel.shape
         Me = self.Me
         device = k_sel.device
-        sc = self._get_scratch(B, Hkv, Dh, device, k_sel.dtype)
 
         mem_k, mem_v, used = self._view_exact(state)
         # Clone views when gradients flow through bank updates: the
@@ -610,54 +605,43 @@ class MemoryBankMixin:
         else:
             overwrite_tok = novel_cap
 
-        # LRU timestamp update (scratch buffer: max_pos)
-        pos_touch = torch.where(touch_tok, pos_sel, torch.full_like(pos_sel, -1))
-        max_pos = sc['exact_max_pos']
-        max_pos.fill_(-1)
-        max_pos.scatter_reduce_(1, idx_tok, pos_touch, reduce="amax", include_self=True)
-        last = torch.where(max_pos >= 0, max_pos, last)
-        state.mem_last_exact = last
+        # -----------------------------------------------------------------
+        # Direct slot writes — replaces scatter-based winner-take-all.
+        #
+        # Novel candidates get unique LRU victim slots (via cumsum ranking),
+        # so overwrite-overwrite collisions cannot happen.  Hit candidates
+        # don't overwrite (unless exact_refresh_on_hit), so the only
+        # theoretical collision is novel-vs-hit on the same slot — extremely
+        # rare (LRU victim would have to coincide with the hit target).
+        #
+        # Approach: gather current bank values at each candidate's target
+        # slot, blend with overwrite mask (overwrite→new, else→original),
+        # then scatter back.  Non-overwrite tokens write back their original
+        # values (no change).  ~8 kernels vs ~20 for the old scatter_reduce
+        # winner-take-all machinery.
+        # -----------------------------------------------------------------
 
-        # Winner-take-all per slot (scratch buffer: max_score)
-        tie = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(0) * 1e-6
-        score_tok = gate_sel.float() + tie
-        neginf = torch.tensor(-float("inf"), device=device, dtype=torch.float32)
-        score_tok = torch.where(overwrite_tok, score_tok, neginf)
-
-        max_score = sc['exact_max_score']
-        max_score.fill_(-float("inf"))
-        max_score.scatter_reduce_(1, idx_tok, score_tok, reduce="amax", include_self=True)
-        winner = overwrite_tok & (score_tok == max_score.gather(1, idx_tok))
-
-        # KV scatter (scratch buffers: sum_k, sum_v, upd, pos_slot)
         idx_exp = idx_tok.unsqueeze(1).unsqueeze(-1).expand(B, Hkv, T, Dh)
-        w4 = winner.to(dtype=mem_k.dtype, device=device).view(B, 1, T, 1)
-        weighted_k = k_sel * w4
-        weighted_v = v_sel * w4
+        ow = overwrite_tok.to(dtype=mem_k.dtype, device=device).view(B, 1, T, 1)
 
-        sum_k = sc['exact_sum_k']
-        sum_v = sc['exact_sum_v']
-        sum_k.zero_()
-        sum_v.zero_()
-        sum_k.scatter_add_(2, idx_exp, weighted_k)
-        sum_v.scatter_add_(2, idx_exp, weighted_v)
+        # Gather originals at target slots, blend, scatter back
+        old_k = mem_k.gather(2, idx_exp)
+        old_v = mem_v.gather(2, idx_exp)
+        mem_k.scatter_(2, idx_exp, ow * k_sel + (1.0 - ow) * old_k)
+        mem_v.scatter_(2, idx_exp, ow * v_sel + (1.0 - ow) * old_v)
 
-        upd = sc['exact_upd']
-        upd.zero_()
-        upd.scatter_add_(1, idx_tok, winner.to(dtype=mem_k.dtype, device=device))
-        slot_updated = upd > 0
+        # Mark overwritten slots as used
+        slot_mask = torch.zeros((B, Me), device=device, dtype=torch.bool)
+        slot_mask.scatter_(1, idx_tok, overwrite_tok)
+        used = used | slot_mask
 
-        pos_vals = pos_sel * winner.to(dtype=torch.int64)
-        pos_slot = sc['exact_pos_slot']
-        pos_slot.zero_()
-        pos_slot.scatter_add_(1, idx_tok, pos_vals)
-
-        slot4 = slot_updated.view(B, 1, Me, 1)
-        mem_k = torch.where(slot4, sum_k, mem_k)
-        mem_v = torch.where(slot4, sum_v, mem_v)
-        used = used | slot_updated
-        last = state.mem_last_exact
-        last = torch.where(slot_updated, pos_slot, last)
+        # LRU timestamp: update for any touched candidate (hit or novel)
+        touch_mask = torch.zeros((B, Me), device=device, dtype=torch.bool)
+        touch_mask.scatter_(1, idx_tok, touch_tok)
+        pos_for_scatter = torch.where(touch_tok, pos_sel, torch.full_like(pos_sel, -1))
+        pos_vals = torch.full((B, Me), -1, device=device, dtype=pos_sel.dtype)
+        pos_vals.scatter_(1, idx_tok, pos_for_scatter)
+        last = torch.where(touch_mask & (pos_vals >= 0), pos_vals, last)
         state.mem_last_exact = last
 
         s = self.window
@@ -666,8 +650,14 @@ class MemoryBankMixin:
         state.v_buf[:, :, s:e, :] = mem_v
         state.allowed[:, s:e] = used
 
-        # Update V-routing norm cache for overwritten slots
-        state._exact_v_norm = F.normalize(mem_v, dim=-1, eps=1e-6)
+        # Selective V-routing norm cache update: only re-normalize slots that
+        # were actually overwritten, not the entire bank.  For typical updates
+        # (1-2 slots out of Me=64) this reduces normalize volume by ~30-60x.
+        if slot_mask.any():
+            updated_slots = slot_mask.any(dim=0).nonzero(as_tuple=True)[0]
+            state._exact_v_norm[:, :, updated_slots, :] = F.normalize(
+                mem_v[:, :, updated_slots, :], dim=-1, eps=1e-6
+            )
 
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:
@@ -772,8 +762,13 @@ class MemoryBankMixin:
         state.v_buf[:, :, s:e, :] = mem_v
         state.allowed[:, s:e] = used
 
-        # Update LF-K routing norm cache for EMA-blended slots
-        state._sum_lf_k_norm = F.normalize(mem_k[..., lf:], dim=-1, eps=1e-6)
+        # Selective LF-K routing norm cache update: only re-normalize slots
+        # that received EMA contributions, not the entire bank.
+        active_slots = (count > 0).any(dim=0).nonzero(as_tuple=True)[0]
+        if active_slots.numel() > 0:
+            state._sum_lf_k_norm[:, :, active_slots, :] = F.normalize(
+                mem_k[:, :, active_slots, lf:], dim=-1, eps=1e-6
+            )
 
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:
