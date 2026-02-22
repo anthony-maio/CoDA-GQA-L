@@ -117,6 +117,14 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         summary_eta_init_logit: float = -3.0,
         summary_candidates_per_block: int = 64,
         summary_overwrite_on_insert: bool = True,
+        # Dynamic bank expansion (hybrid log-ceiling + pressure-gated).
+        # Banks start at min_landmarks_* and can grow to max_landmarks_*.
+        # None = defaults to num_landmarks_* (no expansion, backward compat).
+        min_landmarks_exact: Optional[int] = None,
+        max_landmarks_exact: Optional[int] = None,
+        min_landmarks_summary: Optional[int] = None,
+        max_landmarks_summary: Optional[int] = None,
+        expansion_t_max: int = 1_000_000,
         # Memory init
         mem_init: str = "random_normal",
         mask_unused_memory: bool = True,
@@ -159,8 +167,27 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
         self.energy_scale = math.sqrt(self.head_dim / self.lf_dim)
 
         self.window = int(window)
-        self.Me = int(num_landmarks_exact)
-        self.Ms = int(num_landmarks_summary)
+
+        # Dynamic bank expansion: Me/Ms become the max (physical buffer size).
+        # Me_min/Ms_min are the starting active capacity.
+        _me = int(num_landmarks_exact)
+        _ms = int(num_landmarks_summary)
+        self.Me_min = int(min_landmarks_exact) if min_landmarks_exact is not None else _me
+        self.Me_max = int(max_landmarks_exact) if max_landmarks_exact is not None else _me
+        self.Ms_min = int(min_landmarks_summary) if min_landmarks_summary is not None else _ms
+        self.Ms_max = int(max_landmarks_summary) if max_landmarks_summary is not None else _ms
+        self.expansion_t_max = int(expansion_t_max)
+
+        if self.Me_min > self.Me_max:
+            raise ValueError(f"min_landmarks_exact ({self.Me_min}) > max ({self.Me_max})")
+        if self.Ms_min > self.Ms_max:
+            raise ValueError(f"min_landmarks_summary ({self.Ms_min}) > max ({self.Ms_max})")
+        if self.Me_min < 0 or self.Ms_min < 0:
+            raise ValueError("min_landmarks_* must be non-negative")
+
+        # Physical buffer layout uses max capacity.
+        self.Me = self.Me_max
+        self.Ms = self.Ms_max
         self.Lbuf = self.window + self.Me + self.Ms
 
         # Projections
@@ -277,6 +304,8 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
             recent_filled=0,
             mem_last_exact=mem_last_exact,
             pos=0,
+            active_exact=self.Me_min if self.Me > 0 else 0,
+            active_summary=self.Ms_min if self.Ms > 0 else 0,
         )
 
         # Initialize cached normalized routing targets.
@@ -303,9 +332,67 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
                 "summary_fill_ratio": 0.0,
                 "tokens_gated_out": 0,
                 "total_evictions": 0,
+                "exact_frustrated": 0,
+                "summary_frustrated": 0,
+                "active_exact": state.active_exact,
+                "active_summary": state.active_summary,
+                "expansions_exact": 0,
+                "expansions_summary": 0,
             }
 
         return state
+
+    # ------------------------------------------------------------------
+    # Dynamic bank expansion
+    # ------------------------------------------------------------------
+
+    def _log_ceiling(self, tokens_seen: int) -> Tuple[int, int]:
+        """Compute the maximum allowed active bank size at the current position.
+
+        Returns (ceiling_exact, ceiling_summary).
+        Formula: ceil = min + (max - min) * ln(1 + t) / ln(1 + T_max)
+        """
+        if self.expansion_t_max <= 0:
+            return self.Me_max, self.Ms_max
+        ratio = math.log(1 + tokens_seen) / math.log(1 + self.expansion_t_max)
+        ratio = min(ratio, 1.0)
+        ceil_e = self.Me_min + int((self.Me_max - self.Me_min) * ratio)
+        ceil_s = self.Ms_min + int((self.Ms_max - self.Ms_min) * ratio)
+        return ceil_e, ceil_s
+
+    def _try_expand(
+        self,
+        state: CoDAGQALandmarkStatePerf2,
+        frustrated_exact: int,
+        frustrated_summary: int,
+    ) -> None:
+        """Expand active bank capacity if under pressure and below ceiling.
+
+        Only runs during inference (training uses randomized fixed sizes).
+        Pure Python int arithmetic -- no GPU sync, no tensor ops.
+        """
+        if self.Me_min == self.Me_max and self.Ms_min == self.Ms_max:
+            return  # no expansion configured
+        if frustrated_exact <= 0 and frustrated_summary <= 0:
+            return
+
+        ceil_e, ceil_s = self._log_ceiling(state.pos)
+
+        expand_e = 0
+        if frustrated_exact > 0 and state.active_exact < ceil_e:
+            expand_e = min(frustrated_exact, ceil_e - state.active_exact)
+            state.active_exact += expand_e
+
+        expand_s = 0
+        if frustrated_summary > 0 and state.active_summary < ceil_s:
+            expand_s = min(frustrated_summary, ceil_s - state.active_summary)
+            state.active_summary += expand_s
+
+        if state.metrics is not None:
+            state.metrics["active_exact"] = state.active_exact
+            state.metrics["active_summary"] = state.active_summary
+            state.metrics["expansions_exact"] += expand_e
+            state.metrics["expansions_summary"] += expand_s
 
     # ------------------------------------------------------------------
     # Projections

@@ -313,6 +313,17 @@ class LlamaCoDAAdapter(nn.Module):
                 batch_size=B, device=x.device, dtype=x.dtype,
                 mem_init="zeros",
             )
+            # Randomize active bank sizes so the model learns to work across
+            # the full expansion range.  When Me_min == Me_max (no expansion
+            # configured), randint degenerates to a no-op.
+            if self.coda.Me_max > self.coda.Me_min:
+                state.active_exact = torch.randint(
+                    self.coda.Me_min, self.coda.Me_max + 1, (1,)
+                ).item()
+            if self.coda.Ms_max > self.coda.Ms_min:
+                state.active_summary = torch.randint(
+                    self.coda.Ms_min, self.coda.Ms_max + 1, (1,)
+                ).item()
             y, _ = self.coda.prefill_chunked(x, state, block_size=self.block_size)
             return y
 

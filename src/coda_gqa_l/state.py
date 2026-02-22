@@ -36,6 +36,13 @@ class CoDAGQALandmarkStatePerf2:
     # Absolute position of next token to be written
     pos: int
 
+    # Dynamic bank expansion: active slot counters.
+    # These start at Me_min / Ms_min and can grow up to Me_max / Ms_max.
+    # All bank write/routing logic restricts itself to [:active_exact]
+    # or [:active_summary] within the bank segment.
+    active_exact: int = 0
+    active_summary: int = 0
+
     # Cached normalized routing targets, updated slot-wise on writes.
     # Exact bank: normalized values (V-routing, RoPE-free).
     # Summary bank: normalized LF key band (LF-K routing, position-invariant).

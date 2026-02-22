@@ -243,26 +243,35 @@ class MemoryBankMixin:
 
         mem_k, mem_v, used = self._view_exact(state)
         Me = self.Me
+        Ae = state.active_exact  # active capacity (may be < Me)
 
         # V-routing: cosine similarity on Values (RoPE-free) for semantic matching.
         v_n = F.normalize(v_evict, dim=-1, eps=1e-6)
         mem_n = state._exact_v_norm
         scores_h = torch.einsum("bhd,bhmd->bhm", v_n, mem_n)
         scores = scores_h.mean(dim=1)
+        # Mask inactive slots beyond active capacity.
+        if Ae < Me:
+            scores[:, Ae:] = -1e9
         scores = scores.masked_fill(~used, -1e9)
         best_score, best_idx = scores.max(dim=-1)
 
-        any_used = used.any(dim=-1)
+        any_used = used[:, :Ae].any(dim=-1)
         novel = (~any_used) | (best_score < self.exact_novelty_threshold)
         hit = any_used & (best_score >= self.exact_match_threshold)
 
-        free = ~used
+        # Only search for free/LRU slots within active capacity.
+        free = ~used.clone()
+        if Ae < Me:
+            free[:, Ae:] = False
         free_exists = free.any(dim=-1)
         free_idx = free.to(torch.int64).argmax(dim=-1)
 
         last = state.mem_last_exact
         inf = torch.full_like(last, 2**62)
         last_masked = torch.where(used, last, inf)
+        if Ae < Me:
+            last_masked[:, Ae:] = 2**62  # inactive slots won't be LRU candidates
         lru_idx = last_masked.argmin(dim=-1)
 
         insert_idx = torch.where(free_exists, free_idx, lru_idx)
@@ -312,6 +321,12 @@ class MemoryBankMixin:
         last.scatter_(1, idx.view(B, 1), new.view(B, 1))
         state.mem_last_exact = last
 
+        # Pressure-gated expansion: frustrated = novel token forced to LRU-evict
+        # when all active slots are occupied.
+        frustrated = int((novel & keep_b & ~free_exists).any().item())
+        if frustrated > 0 and not self.training:
+            self._try_expand(state, frustrated_exact=frustrated, frustrated_summary=0)
+
     # ------------------------------------------------------------------
     # Summary bank update (single token, decode path)
     # ------------------------------------------------------------------
@@ -334,6 +349,7 @@ class MemoryBankMixin:
         B = k_evict.size(0)
         device = k_evict.device
         Ms = self.Ms
+        As = state.active_summary  # active capacity (may be < Ms)
 
         if self.write_policy != "none":
             keep_b = gate >= self.write_gate_threshold_summary
@@ -348,6 +364,9 @@ class MemoryBankMixin:
         mem_n = state._sum_lf_k_norm
         scores_h = torch.einsum("bhd,bhmd->bhm", k_lf_n, mem_n)
         scores = scores_h.mean(dim=1)
+        # Mask inactive slots beyond active capacity.
+        if As < Ms:
+            scores[:, As:] = -1e9
         idx = scores.argmax(dim=-1)
 
         eta_base = torch.sigmoid(self.summary_eta_logit).to(device=device, dtype=mem_k.dtype)
@@ -385,10 +404,17 @@ class MemoryBankMixin:
         # Update LF-K routing norm cache
         state._sum_lf_k_norm = F.normalize(mem_k[..., lf:], dim=-1, eps=1e-6)
 
+        # Pressure-gated expansion: all active slots used and incoming data.
+        all_active_used = used[:, :As].all()
+        frustrated_s = int((all_active_used & keep_b.any()).item())
+        if frustrated_s > 0 and not self.training:
+            self._try_expand(state, frustrated_exact=0, frustrated_summary=frustrated_s)
+
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:
             m = state.metrics
             m["summary_updates"] += int(keep_b.sum().item())
+            m["summary_frustrated"] += frustrated_s
             # Count inserts into previously-empty slots
             if self.summary_overwrite_on_insert:
                 # is_new was computed above as (~used_before_write for the target slot)
@@ -558,6 +584,7 @@ class MemoryBankMixin:
             return
         B, Hkv, T, Dh = k_sel.shape
         Me = self.Me
+        Ae = state.active_exact  # active capacity (may be < Me)
         device = k_sel.device
 
         mem_k, mem_v, used = self._view_exact(state)
@@ -581,10 +608,13 @@ class MemoryBankMixin:
         # Fast path: Triton kernel fuses matmul, mean, max, classification,
         # LRU victim selection, and sequential state update into 1 launch.
         # Fallback: pure-PyTorch reference path (~15 kernel launches).
+        # NOTE: Triton path does not yet support dynamic expansion (Ae < Me);
+        # fall back to PyTorch when active capacity is restricted.
         can_use_triton = (
             _HAS_TRITON_ROUTE
             and not self.training
             and v_sel_norm.is_cuda
+            and Ae >= Me  # Triton path assumes full bank capacity
         )
 
         if can_use_triton:
@@ -609,6 +639,10 @@ class MemoryBankMixin:
             ).view(B, Hkv, T, Me)
             scores = scores_h.mean(dim=1)
 
+            # Mask inactive slots (beyond active capacity) before used-mask.
+            if Ae < Me:
+                inactive = torch.arange(Me, device=device).unsqueeze(0) >= Ae
+                scores.masked_fill_(inactive.unsqueeze(1), -1e9)
             scores.masked_fill_(~used[:, None, :], -1e9)
             best_score, best_idx = scores.max(dim=-1)
             any_used = used.any(dim=-1)
@@ -619,11 +653,13 @@ class MemoryBankMixin:
 
             rank_key = last.clone()
             rank_key[~used] = -(2**62)
-            lru_k = min(T, Me)
+            if Ae < Me:
+                rank_key[:, Ae:] = -(2**62)  # inactive slots are not LRU candidates
+            lru_k = min(T, Ae)
             _, lru_slots = torch.topk(rank_key, k=lru_k, dim=1, largest=False, sorted=True)
 
             novel_rank = novel_keep.to(torch.int64).cumsum(dim=1) - 1
-            novel_cap = novel_keep & (novel_rank < Me)
+            novel_cap = novel_keep & (novel_rank < Ae)
 
             rank_clamped = novel_rank.clamp(min=0, max=max(lru_k - 1, 0))
             slot_assigned = lru_slots.gather(1, rank_clamped)
@@ -701,10 +737,16 @@ class MemoryBankMixin:
             mem_v[:, :, updated_slots, :], dim=-1, eps=1e-6
         )
 
+        # Pressure-gated expansion: count frustrated tokens (novel but capped).
+        frustrated = int((novel_keep & ~novel_cap).sum().item())
+        if frustrated > 0 and not self.training:
+            self._try_expand(state, frustrated_exact=frustrated, frustrated_summary=0)
+
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:
             m = state.metrics
             m["exact_overwrites"] += int(overwrite_tok.sum().item())
+            m["exact_frustrated"] += frustrated
             if self.Me > 0:
                 m["exact_fill_ratio"] = float(used.any(dim=0).float().mean().item())
             if not can_use_triton:
@@ -739,6 +781,7 @@ class MemoryBankMixin:
             return
         B, Hkv, T, Dh = k_sel.shape
         Ms = self.Ms
+        As = state.active_summary  # active capacity (may be < Ms)
         device = k_sel.device
         sc = self._get_scratch(B, Hkv, Dh, device, k_sel.dtype)
 
@@ -758,6 +801,10 @@ class MemoryBankMixin:
             mem_n.reshape(B * Hkv, Ms, Dh_lf).transpose(1, 2),
         ).view(B, Hkv, T, Ms)
         scores = scores_h.mean(dim=1)
+        # Mask inactive slots beyond active capacity.
+        if As < Ms:
+            inactive_s = torch.arange(Ms, device=device).unsqueeze(0) >= As
+            scores.masked_fill_(inactive_s.unsqueeze(1), -1e9)
         idx_tok = scores.argmax(dim=-1)
 
         w = w_tok.to(device=device, dtype=mem_k.dtype)
@@ -814,10 +861,19 @@ class MemoryBankMixin:
                 mem_k[:, :, active_slots, lf:], dim=-1, eps=1e-6
             )
 
+        # Pressure-gated expansion: frustrated when all active slots are used
+        # and new tokens are arriving (being merged rather than creating new prototypes).
+        all_active_used = used[:, :As].all()
+        has_incoming = (count[:, :As] > 0).any()
+        frustrated_s = int(all_active_used.item() and has_incoming.item())
+        if frustrated_s > 0 and not self.training:
+            self._try_expand(state, frustrated_exact=0, frustrated_summary=frustrated_s)
+
         # Metrics (opt-in; guarded so zero overhead when disabled)
         if state.metrics is not None:
             m = state.metrics
             m["summary_updates"] += int((count > 0).sum().item())
+            m["summary_frustrated"] += frustrated_s
             if self.summary_overwrite_on_insert:
                 m["summary_inserts"] += int(new_slots.sum().item())
             if self.Ms > 0:
