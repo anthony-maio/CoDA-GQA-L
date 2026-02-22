@@ -272,6 +272,8 @@ def switch_to_bounded(
     window: int = 256,
     num_landmarks_exact: int = 64,
     num_landmarks_summary: int = 64,
+    max_landmarks_exact: Optional[int] = None,
+    max_landmarks_summary: Optional[int] = None,
     block_size: int = 256,
     detach_evicted: bool = True,
 ) -> Tuple[nn.Module, List[LlamaCoDAAdapter]]:
@@ -282,6 +284,10 @@ def switch_to_bounded(
     Bounded-only params (write_proj, summary_eta_logit) start at their defaults.
 
     Args:
+        max_landmarks_exact: Maximum exact bank slots for dynamic expansion.
+            None (default) means no expansion (fixed at num_landmarks_exact).
+        max_landmarks_summary: Maximum summary bank slots for dynamic expansion.
+            None (default) means no expansion (fixed at num_landmarks_summary).
         detach_evicted: If True (default), evicted tokens are detached before
             writing to memory banks, blocking gradients through the bank update
             path.  Set False to allow write_proj and summary_eta_logit to
@@ -295,6 +301,12 @@ def switch_to_bounded(
 
     for i, (block, adapter_ub) in enumerate(zip(blocks, adapters_ub)):
         coda_ub = adapter_ub.coda
+
+        expand_kwargs = {}
+        if max_landmarks_exact is not None:
+            expand_kwargs["max_landmarks_exact"] = max_landmarks_exact
+        if max_landmarks_summary is not None:
+            expand_kwargs["max_landmarks_summary"] = max_landmarks_summary
 
         adapter_b = LlamaCoDAAdapter(
             hidden_size=adapter_ub.hidden_size,
@@ -310,6 +322,7 @@ def switch_to_bounded(
             num_landmarks_summary=num_landmarks_summary,
             block_size=block_size,
             detach_evicted=detach_evicted,
+            **expand_kwargs,
         )
         adapter_b = adapter_b.to(device=device, dtype=dtype)
         coda_b = adapter_b.coda
@@ -333,8 +346,13 @@ def switch_to_bounded(
         adapters_b.append(adapter_b)
 
     print(f"  Switched {len(adapters_b)} layers: unbounded -> bounded")
+    expand_str = ""
+    if max_landmarks_exact is not None and max_landmarks_exact > num_landmarks_exact:
+        expand_str += f", max_Me={max_landmarks_exact}"
+    if max_landmarks_summary is not None and max_landmarks_summary > num_landmarks_summary:
+        expand_str += f", max_Ms={max_landmarks_summary}"
     print(f"  Config: W={window}, Me={num_landmarks_exact}, "
-          f"Ms={num_landmarks_summary}, block_size={block_size}")
+          f"Ms={num_landmarks_summary}, block_size={block_size}{expand_str}")
     return model, adapters_b
 
 
@@ -894,6 +912,8 @@ def train(
 BOUNDED_CONFIGS = {
     "tiny": {"window": 128, "Me": 32, "Ms": 32},
     "medium": {"window": 256, "Me": 64, "Ms": 64},
+    "medium-expand": {"window": 256, "Me": 64, "Ms": 64,
+                      "max_Me": 128, "max_Ms": 128},
     "large": {"window": 512, "Me": 128, "Ms": 128},
 }
 
@@ -1026,8 +1046,14 @@ def main() -> None:
     print(f"  Phase 1:   {args.max_steps} steps (unbounded)")
     if args.bounded_steps > 0:
         bcfg = BOUNDED_CONFIGS[args.bounded_config]
+        expand_info = ""
+        if bcfg.get("max_Me"):
+            expand_info += f", max_Me={bcfg['max_Me']}"
+        if bcfg.get("max_Ms"):
+            expand_info += f", max_Ms={bcfg['max_Ms']}"
         print(f"  Phase 2:   {args.bounded_steps} steps (bounded, "
-              f"W={bcfg['window']}, Me={bcfg['Me']}, Ms={bcfg['Ms']})")
+              f"W={bcfg['window']}, Me={bcfg['Me']}, Ms={bcfg['Ms']}"
+              f"{expand_info})")
     print(f"  Batch:     {args.batch_size} x {args.grad_accum} accum x {args.seq_len} seq")
     print(f"  Eff batch: {eff_batch:,} tokens/update")
     print(f"  Freeze:    {args.freeze}")
@@ -1135,6 +1161,8 @@ def main() -> None:
             window=bcfg["window"],
             num_landmarks_exact=bcfg["Me"],
             num_landmarks_summary=bcfg["Ms"],
+            max_landmarks_exact=bcfg.get("max_Me"),
+            max_landmarks_summary=bcfg.get("max_Ms"),
             block_size=args.bounded_block_size,
             detach_evicted=detach,
         )
