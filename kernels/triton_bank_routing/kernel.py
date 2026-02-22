@@ -77,21 +77,25 @@ def _exact_bank_route_kernel(
     # Dimensions
     H_KV: tl.constexpr,
     T: tl.constexpr,       # num candidates (typ 8-16)
-    ME: tl.constexpr,      # exact bank size (typ 64)
+    ME: tl.constexpr,      # exact bank size (physical, typ 64)
     DH: tl.constexpr,      # head dim (typ 128)
     REFRESH_ON_HIT: tl.constexpr,  # bool
+    AE: tl.constexpr,      # active exact capacity (<= ME); slots >= AE are inactive
 ):
     off_b = tl.program_id(0)
 
     offs_me = tl.arange(0, ME)
     offs_dh = tl.arange(0, DH)
 
+    # Mask for active slots: only slots [0, AE) participate in routing.
+    active_mask = offs_me < AE
+
     # ------------------------------------------------------------------
     # 1. Load shared routing state into SRAM (registers)
     # ------------------------------------------------------------------
     # used: (ME,) bool — loaded as int8
     used_ptrs = USED + off_b * stride_ub + offs_me * stride_um
-    sram_used = tl.load(used_ptrs).to(tl.int1)
+    sram_used = tl.load(used_ptrs).to(tl.int1) & active_mask
 
     # last: (ME,) int64 — LRU timestamps
     last_ptrs = LAST_IN + off_b * stride_lb + offs_me * stride_lm
@@ -144,8 +148,8 @@ def _exact_bank_route_kernel(
 
             avg_scores = avg_scores / H_KV
 
-            # Mask unused slots
-            avg_scores = tl.where(sram_used, avg_scores, -1e9)
+            # Mask unused and inactive slots
+            avg_scores = tl.where(sram_used & active_mask, avg_scores, -1e9)
 
             best_score = tl.max(avg_scores, axis=0)
             best_idx = tl.argmax(avg_scores, axis=0).to(tl.int64)
@@ -159,7 +163,12 @@ def _exact_bank_route_kernel(
             if is_novel:
                 # Find LRU victim: slot with minimum timestamp.
                 # Unused slots get -inf timestamp so they're picked first.
-                lru_key = tl.where(sram_used, sram_last, tl.full([ME], value=-2**62, dtype=tl.int64))
+                # Inactive slots (>= AE) get +inf so they're never picked.
+                lru_key = tl.where(
+                    active_mask,
+                    tl.where(sram_used, sram_last, tl.full([ME], value=-2**62, dtype=tl.int64)),
+                    tl.full([ME], value=2**62, dtype=tl.int64),
+                )
                 victim = tl.argmin(lru_key, axis=0).to(tl.int64)
 
                 idx_t = victim

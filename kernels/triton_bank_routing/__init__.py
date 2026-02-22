@@ -55,6 +55,7 @@ def exact_bank_route(
     tau_match: float,
     tau_novel: float,
     refresh_on_hit: bool = False,
+    active_exact: int = -1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Fused exact-bank routing: score + classify + LRU assign in one kernel.
 
@@ -69,6 +70,8 @@ def exact_bank_route(
         tau_match:   Cosine similarity threshold for a "hit".
         tau_novel:   Maximum cosine similarity for "novel" classification.
         refresh_on_hit: Whether hits overwrite the slot (refresh K/V).
+        active_exact: Active bank capacity (slots [0, active_exact) are usable).
+                      -1 or >= Me means use all slots (no expansion restriction).
 
     Returns:
         idx_tok:       (B, T) int64  — target slot index per candidate
@@ -80,11 +83,12 @@ def exact_bank_route(
         return _fallback(
             v_sel_norm, mem_v_norm, used, last, gate_sel, pos_sel,
             tau_gate=tau_gate, tau_match=tau_match, tau_novel=tau_novel,
-            refresh_on_hit=refresh_on_hit,
+            refresh_on_hit=refresh_on_hit, active_exact=active_exact,
         )
 
     B, Hkv, T, Dh = v_sel_norm.shape
     _, _, Me, _ = mem_v_norm.shape
+    Ae = active_exact if 0 < active_exact < Me else Me
 
     # Ensure contiguous
     v_sel_norm = v_sel_norm.contiguous()
@@ -132,6 +136,7 @@ def exact_bank_route(
         # Dimensions
         H_KV=Hkv, T=T, ME=Me, DH=Dh,
         REFRESH_ON_HIT=refresh_on_hit,
+        AE=Ae,
     )
 
     return idx_tok, overwrite_tok, touch_tok, last_out
@@ -149,12 +154,14 @@ def _fallback(
     tau_match: float,
     tau_novel: float,
     refresh_on_hit: bool,
+    active_exact: int = -1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """PyTorch reference fallback (same semantics as the Triton kernel)."""
     import torch.nn.functional as F
 
     B, Hkv, T, Dh = v_sel_norm.shape
     Me = mem_v_norm.shape[2]
+    Ae = active_exact if 0 < active_exact < Me else Me
     device = v_sel_norm.device
 
     keep_tok = gate_sel >= tau_gate
@@ -165,6 +172,10 @@ def _fallback(
         mem_v_norm.reshape(B * Hkv, Me, Dh).transpose(1, 2),
     ).view(B, Hkv, T, Me)
     scores = scores_h.mean(dim=1)
+    # Mask inactive slots (beyond active capacity)
+    if Ae < Me:
+        inactive = torch.arange(Me, device=device).unsqueeze(0) >= Ae
+        scores.masked_fill_(inactive.unsqueeze(1), -1e9)
     scores.masked_fill_(~used[:, None, :], -1e9)
 
     best_score, best_idx = scores.max(dim=-1)
@@ -189,11 +200,13 @@ def _fallback(
                 continue
 
             if novel_keep[b, t]:
-                # Find LRU victim
+                # Find LRU victim (only among active slots)
                 lru_key = torch.where(
                     sram_used[b], sram_last[b],
                     torch.full((Me,), -(2**62), device=device, dtype=torch.int64),
                 )
+                if Ae < Me:
+                    lru_key[Ae:] = 2**62  # inactive slots never picked
                 victim = lru_key.argmin().item()
                 idx_tok[b, t] = victim
                 overwrite_tok[b, t] = True

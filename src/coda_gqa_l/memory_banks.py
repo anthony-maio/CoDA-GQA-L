@@ -608,13 +608,10 @@ class MemoryBankMixin:
         # Fast path: Triton kernel fuses matmul, mean, max, classification,
         # LRU victim selection, and sequential state update into 1 launch.
         # Fallback: pure-PyTorch reference path (~15 kernel launches).
-        # NOTE: Triton path does not yet support dynamic expansion (Ae < Me);
-        # fall back to PyTorch when active capacity is restricted.
         can_use_triton = (
             _HAS_TRITON_ROUTE
             and not self.training
             and v_sel_norm.is_cuda
-            and Ae >= Me  # Triton path assumes full bank capacity
         )
 
         if can_use_triton:
@@ -624,6 +621,7 @@ class MemoryBankMixin:
                 tau_match=self.exact_match_threshold,
                 tau_novel=self.exact_novelty_threshold,
                 refresh_on_hit=self.exact_refresh_on_hit,
+                active_exact=Ae,
             )
             state.mem_last_exact = last
         else:
