@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -259,6 +259,47 @@ class LlamaCoDAAdapter(nn.Module):
             coda.o_proj.bias.data.copy_(llama_attn.o_proj.bias.data)
 
         return adapter
+
+    @classmethod
+    def swap_llama_layers(
+        cls,
+        model: nn.Module,
+        bounded: bool = False,
+        head_norm_mode: str = "identity",
+        rope_interleaved: bool = False,
+        **coda_kwargs,
+    ) -> List["LlamaCoDAAdapter"]:
+        """Replace all attention layers in a Llama-family model with CoDA adapters.
+
+        Iterates over ``model.model.layers``, calls :meth:`from_llama_attention`
+        on each ``self_attn``, and replaces it in-place.
+
+        Args:
+            model: A HuggingFace Llama-family model (LlamaForCausalLM or similar).
+            bounded: Whether to use bounded-memory mode.
+            head_norm_mode: Forwarded to :meth:`from_llama_attention`.
+            rope_interleaved: Forwarded to :meth:`from_llama_attention`.
+            **coda_kwargs: Forwarded to the adapter constructor (window,
+                num_landmarks_exact, num_landmarks_summary, block_size, etc.).
+
+        Returns:
+            List of the created :class:`LlamaCoDAAdapter` instances (one per layer).
+        """
+        blocks = model.model.layers
+        adapters: List[LlamaCoDAAdapter] = []
+
+        for block in blocks:
+            adapter = cls.from_llama_attention(
+                block.self_attn,
+                bounded=bounded,
+                head_norm_mode=head_norm_mode,
+                rope_interleaved=rope_interleaved,
+                **coda_kwargs,
+            )
+            block.self_attn = adapter
+            adapters.append(adapter)
+
+        return adapters
 
     # ------------------------------------------------------------------
     # Forward (compatible with Llama attention interface)
