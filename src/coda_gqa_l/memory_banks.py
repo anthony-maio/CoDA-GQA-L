@@ -441,12 +441,14 @@ class MemoryBankMixin:
         k_old, v_old, g_old = self._get_recent_time_order(state)
         Lr = int(k_old.size(2))
 
-        # When gradients flow through evicted tokens (detach_evicted=False),
-        # clone state buffers so subsequent in-place writes (bank updates,
-        # ring buffer zero/fill) don't invalidate tensors saved by autograd
-        # during the SDPA computation above.  k_old/v_old/g_old already
-        # reference the originals; writes will go to the clones only.
-        if not self.detach_evicted:
+        # During training, clone state buffers so subsequent in-place writes
+        # (bank updates, ring buffer zero/fill) don't invalidate tensors saved
+        # by autograd during the SDPA computation above.  Even with
+        # detach_evicted=True, the bank writes (state.k_buf[:,:,s:e,:] = ...)
+        # are in-place on the same tensor SDPA saved views of for backward.
+        # k_old/v_old/g_old already reference the originals; writes will go
+        # to the clones only.
+        if self.training:
             state.k_buf = state.k_buf.clone()
             state.v_buf = state.v_buf.clone()
             state.g_recent = state.g_recent.clone()
