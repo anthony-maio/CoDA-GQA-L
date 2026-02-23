@@ -704,21 +704,21 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
                 outs.append(y_blk)
 
             if write_cache:
-                # During training, sever state buffers from the autograd graph
-                # before bank/ring writes.  SDPA has already saved what it needs
-                # for backward.  Subsequent in-place writes (bank scatter, ring
-                # zero+fill, norm cache update) would increment the version
-                # counter of any graph-connected tensor, invalidating saved
-                # views and causing "modified by an inplace operation" errors.
-                # detach().clone() creates fully independent buffers.
+                # During training, protect the autograd graph from in-place
+                # bank/ring writes by allocating fresh memory for the state.
+                # SDPA has already saved references to the old memory for
+                # backward.  clone() WITHOUT detach() so gradients still flow
+                # backward across chunk boundaries (the clone creates a new
+                # tensor at version 0; in-place writes go to the clone only,
+                # leaving the original at the version SDPA expects).
                 if self.training:
-                    state.k_buf = state.k_buf.detach().clone()
-                    state.v_buf = state.v_buf.detach().clone()
-                    state.g_recent = state.g_recent.detach().clone()
+                    state.k_buf = state.k_buf.clone()
+                    state.v_buf = state.v_buf.clone()
+                    state.g_recent = state.g_recent.clone()
                     if hasattr(state, '_exact_v_norm') and state._exact_v_norm is not None:
-                        state._exact_v_norm = state._exact_v_norm.detach().clone()
+                        state._exact_v_norm = state._exact_v_norm.clone()
                     if hasattr(state, '_sum_lf_k_norm') and state._sum_lf_k_norm is not None:
-                        state._sum_lf_k_norm = state._sum_lf_k_norm.detach().clone()
+                        state._sum_lf_k_norm = state._sum_lf_k_norm.clone()
                 self._write_block_fast(state, k_blk=k_blk, v_blk=v_blk, g_blk=g_blk, pos0=pos0)
 
             t += blk

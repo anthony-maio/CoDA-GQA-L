@@ -584,11 +584,12 @@ class MemoryBankMixin:
         device = k_sel.device
 
         mem_k, mem_v, used = self._view_exact(state)
-        # Clone views when gradients flow through bank updates: the
-        # write-back (state.k_buf[:, :, s:e, :] = ...) increments the base
-        # tensor's version, invalidating autograd-saved references to these
-        # views.  Cloning makes them independent tensors.
-        if not self.detach_evicted:
+        # Clone views when training: gather (line ~700) saves mem_k/mem_v
+        # for backward, then the write-back (state.k_buf[:, :, s:e, :] = ...)
+        # increments the base tensor's version — invalidating the saved
+        # reference.  Cloning makes them independent tensors whose version
+        # stays at 0 regardless of later writes to state.k_buf.
+        if self.training or not self.detach_evicted:
             mem_k = mem_k.clone()
             mem_v = mem_v.clone()
         last = state.mem_last_exact
@@ -793,7 +794,10 @@ class MemoryBankMixin:
         sc = self._get_scratch(B, Hkv, Dh, device, k_sel.dtype)
 
         mem_k, mem_v, used = self._view_sum(state)
-        if not self.detach_evicted:
+        # Clone views when training: EMA reads mem_k/mem_v, then the
+        # write-back (state.k_buf[:, :, s:e, :] = ...) increments the base
+        # tensor's version.  Same rationale as _exact_update_block_vectorized.
+        if self.training or not self.detach_evicted:
             mem_k = mem_k.clone()
             mem_v = mem_v.clone()
 
