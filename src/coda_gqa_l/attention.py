@@ -51,13 +51,8 @@ except ImportError:
 # computes both attention streams + differential epilogue in one pass.
 _HAS_TRITON_FLASH = False
 try:
-    import sys as _sys
-    from pathlib import Path as _Path
-    _kernels_dir = str(_Path(__file__).resolve().parent.parent.parent / "kernels")
-    if _kernels_dir not in _sys.path:
-        _sys.path.insert(0, _kernels_dir)
-    from triton_diff_flash import diff_flash_attn as _triton_diff_flash
-    from triton_diff_flash import is_available as _triton_flash_available
+    from .triton_diff_flash import diff_flash_attn as _triton_diff_flash
+    from .triton_diff_flash import is_available as _triton_flash_available
     _HAS_TRITON_FLASH = _triton_flash_available()
 except ImportError:
     pass

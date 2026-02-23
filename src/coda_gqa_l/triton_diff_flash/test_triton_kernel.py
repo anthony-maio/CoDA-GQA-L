@@ -15,9 +15,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-# Add kernels/ to path so `import triton_diff_flash` resolves
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from triton_diff_flash import diff_flash_attn, is_available, diagnose
+# Import from package (subpackage of coda_gqa_l)
+from coda_gqa_l.triton_diff_flash import diff_flash_attn, is_available, diagnose
 
 
 # ---------------------------------------------------------------------------

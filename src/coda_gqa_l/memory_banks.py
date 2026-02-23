@@ -17,8 +17,8 @@ from .state import CoDAGQALandmarkStatePerf2
 # Triton fused exact-bank routing: scores + classifies + assigns LRU slots
 # in a single kernel pass.  Falls back to PyTorch when unavailable.
 try:
-    from triton_bank_routing import exact_bank_route as _triton_exact_route
-    from triton_bank_routing import is_available as _triton_route_available
+    from .triton_bank_routing import exact_bank_route as _triton_exact_route
+    from .triton_bank_routing import is_available as _triton_route_available
     _HAS_TRITON_ROUTE = _triton_route_available()
 except ImportError:
     _HAS_TRITON_ROUTE = False

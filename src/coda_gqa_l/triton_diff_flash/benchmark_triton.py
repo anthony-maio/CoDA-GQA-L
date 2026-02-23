@@ -18,8 +18,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from triton_diff_flash import diff_flash_attn, is_available, diagnose
+from coda_gqa_l.triton_diff_flash import diff_flash_attn, is_available, diagnose
 
 
 # ---------------------------------------------------------------------------

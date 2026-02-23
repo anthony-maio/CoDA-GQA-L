@@ -49,10 +49,5 @@ Homepage = "https://github.com/anthony-maio/CoDA-GQA-L"
 Repository = "https://github.com/anthony-maio/CoDA-GQA-L"
 Issues = "https://github.com/anthony-maio/CoDA-GQA-L/issues"
 
-[tool.setuptools]
-packages = ["coda_gqa_l", "triton_bank_routing", "triton_diff_flash"]
-
-[tool.setuptools.package-dir]
-coda_gqa_l = "src/coda_gqa_l"
-triton_bank_routing = "kernels/triton_bank_routing"
-triton_diff_flash = "kernels/triton_diff_flash"
+[tool.setuptools.packages.find]
+where = ["src"]
