@@ -101,7 +101,9 @@ def _exact_bank_route_kernel(
     last_ptrs = LAST_IN + off_b * stride_lb + offs_me * stride_lm
     sram_last = tl.load(last_ptrs)
 
-    any_used = tl.max(sram_used.to(tl.int32), axis=0) > 0
+    # Keep as int32 (not bool) so the type is stable when reassigned in the
+    # novel-insert branch (Triton requires consistent types across if/else).
+    any_used = tl.max(sram_used.to(tl.int32), axis=0)
 
     # ------------------------------------------------------------------
     # 2. Process each candidate sequentially
