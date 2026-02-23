@@ -736,7 +736,20 @@ class MemoryBankMixin:
         )
 
         # Pressure-gated expansion: count frustrated tokens (novel but capped).
-        frustrated = int((novel_keep & ~novel_cap).sum().item())
+        # Triton path: overwrite_tok marks inserts; if all active slots are
+        # used and we're still inserting, some candidates were capped.
+        # Approximate: frustrated ≈ 0 when Ae == Me (no expansion configured).
+        if can_use_triton:
+            frustrated = 0
+            if Ae < Me:
+                # Conservative estimate: overwrites that hit the last active slot
+                # suggest pressure. Exact count requires PyTorch path.
+                n_inserts = int(overwrite_tok.sum().item())
+                n_used = int(used.sum().item())
+                if n_used >= Ae and n_inserts > 0:
+                    frustrated = max(0, n_inserts - (Ae - n_used + n_inserts))
+        else:
+            frustrated = int((novel_keep & ~novel_cap).sum().item())
         if frustrated > 0 and not self.training:
             self._try_expand(state, frustrated_exact=frustrated, frustrated_summary=0)
 
