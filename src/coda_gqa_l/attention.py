@@ -704,6 +704,21 @@ class CoDAGQALandmarkPerf2(MemoryBankMixin, nn.Module):
                 outs.append(y_blk)
 
             if write_cache:
+                # During training, sever state buffers from the autograd graph
+                # before bank/ring writes.  SDPA has already saved what it needs
+                # for backward.  Subsequent in-place writes (bank scatter, ring
+                # zero+fill, norm cache update) would increment the version
+                # counter of any graph-connected tensor, invalidating saved
+                # views and causing "modified by an inplace operation" errors.
+                # detach().clone() creates fully independent buffers.
+                if self.training:
+                    state.k_buf = state.k_buf.detach().clone()
+                    state.v_buf = state.v_buf.detach().clone()
+                    state.g_recent = state.g_recent.detach().clone()
+                    if hasattr(state, '_exact_v_norm') and state._exact_v_norm is not None:
+                        state._exact_v_norm = state._exact_v_norm.detach().clone()
+                    if hasattr(state, '_sum_lf_k_norm') and state._sum_lf_k_norm is not None:
+                        state._sum_lf_k_norm = state._sum_lf_k_norm.detach().clone()
                 self._write_block_fast(state, k_blk=k_blk, v_blk=v_blk, g_blk=g_blk, pos0=pos0)
 
             t += blk

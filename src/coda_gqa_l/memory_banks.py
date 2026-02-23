@@ -441,17 +441,11 @@ class MemoryBankMixin:
         k_old, v_old, g_old = self._get_recent_time_order(state)
         Lr = int(k_old.size(2))
 
-        # During training, clone state buffers so subsequent in-place writes
-        # (bank updates, ring buffer zero/fill) don't invalidate tensors saved
-        # by autograd during the SDPA computation above.  Even with
-        # detach_evicted=True, the bank writes (state.k_buf[:,:,s:e,:] = ...)
-        # are in-place on the same tensor SDPA saved views of for backward.
-        # k_old/v_old/g_old already reference the originals; writes will go
-        # to the clones only.
-        if self.training:
-            state.k_buf = state.k_buf.clone()
-            state.v_buf = state.v_buf.clone()
-            state.g_recent = state.g_recent.clone()
+        # Note: during training, state buffers are detached+cloned in
+        # prefill_chunked() BEFORE calling this method.  This severs the
+        # autograd graph so in-place writes here (bank scatter, ring zero+fill)
+        # don't invalidate SDPA's saved tensors.  k_old/v_old/g_old reference
+        # the detached clones; all writes go to them safely.
 
         k_cat = torch.cat([k_old, k_blk], dim=2)
         v_cat = torch.cat([v_old, v_blk], dim=2)
