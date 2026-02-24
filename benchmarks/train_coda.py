@@ -1017,6 +1017,13 @@ Examples:
     p.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing",
                     action="store_false")
 
+    # Resume.
+    p.add_argument("--adapter-weights", type=str, default=None,
+                    help="Path to a Phase 1 checkpoint (coda_adapters.pt) to load "
+                         "before training.  Use with --max-steps 0 --bounded-steps N "
+                         "to skip Phase 1 and start Phase 2 directly from pre-trained "
+                         "unbounded weights.")
+
     # Output.
     p.add_argument("--output-dir", type=str, default=None)
 
@@ -1082,6 +1089,23 @@ def main() -> None:
         theta_init=0.0 if args.no_differential else args.theta_init,
         lambda_init_bias=lambda_init_bias,
     )
+
+    # --- Load pre-trained adapter weights (optional) ---
+    if args.adapter_weights is not None:
+        ckpt_path = Path(args.adapter_weights)
+        print(f"  Loading adapter weights from {ckpt_path}")
+        state = torch.load(ckpt_path, map_location=device, weights_only=True)
+        loaded = 0
+        for i, adapter in enumerate(adapters):
+            key = f"layer_{i}"
+            if key in state:
+                result = adapter.load_state_dict(state[key], strict=False)
+                loaded += 1
+                if i == 0 and result.missing_keys:
+                    print(f"  Note: missing keys (expected for Phase 1→2): "
+                          f"{result.missing_keys}")
+        del state
+        print(f"  Loaded weights for {loaded}/{len(adapters)} layers")
 
     # --- Gradient checkpointing ---
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
