@@ -133,14 +133,16 @@ python benchmarks/train_coda.py \
 | medium | 256    | 64    | 64      | 384         |
 | large  | 512    | 128   | 128     | 768         |
 
-### Training results (SmolLM2-135M on H200 NVL)
+### Training results (Mistral-7B-v0.3 on H200 NVL)
 
 | Phase | Steps | PPL start | PPL end | Throughput |
 |-------|-------|-----------|---------|------------|
-| Phase 1 (unbounded) | 2000 | 70.0 | 22.0 | 36K tok/s |
-| Phase 2 (bounded, medium) | 2000 | 35.75 | 31.12 | 1.8K tok/s |
+| Phase 1 (unbounded) | 2,000 | 23.50 | 5.75 | ~4,950 tok/s |
+| Phase 2 (bounded, medium) | 600 | 27.88 | 6.31 | ~2,000 tok/s |
 
-41.5% PPL gap for 5.3x context compression. Phase 2 trains with `detach_evicted=False` so gradients flow through bank updates.
+**23.5% PPL overhead** (+1.13 PPL) vs. the 4.81 baseline for **9.5x memory compression**. Context-length scaling is remarkably flat: 5.94 at 2K, 5.95 at 4K. Total training time: ~1.6 hours on H200.
+
+Phase 2 trains with `detach_evicted=False` so gradients flow through bank updates.
 
 ## Benchmarks
 
@@ -223,7 +225,7 @@ Bounded is mathematically identical to unbounded when W >= L (no evictions):
 | 1024 | 1024 | 1.5e-7 |
 | 2048 | 2048 | 1.8e-7 |
 
-60 tests covering correctness, determinism, edge configs, invariants, and backward pass safety.
+56 tests covering correctness, determinism, edge configs, invariants, and backward pass safety.
 
 ```bash
 python -m pytest tests/ -v
@@ -233,21 +235,23 @@ python -m pytest tests/ -v
 
 ```
 src/coda_gqa_l/
-  attention.py       CoDAGQALandmarkPerf2 (main module)
-  memory_banks.py    Exact/summary bank updates (mixin)
-  state.py           KV buffer + ring metadata dataclass
-  primitives.py      RoPE, RMSNorm, GQA utils
-  baseline.py        Unbounded CoDAGQA + standard GQA
-  llama_adapter.py   Drop-in for Llama/Mistral/SmolLM
-  eve_adapter.py     Drop-in for Eve-2 MoE
+  attention.py            CoDAGQALandmarkPerf2 (main module)
+  memory_banks.py         Exact/summary bank updates (mixin)
+  state.py                KV buffer + ring metadata dataclass
+  primitives.py           RoPE, RMSNorm, GQA utils
+  baseline.py             Unbounded CoDAGQA + standard GQA
+  llama_adapter.py        Drop-in for Llama/Mistral/SmolLM
+  eve_adapter.py          Drop-in for Eve-2 MoE
+  triton_diff_flash/      Fused differential FlashAttention kernel
+  triton_bank_routing/    Fused exact-bank routing kernel
 
 benchmarks/
-  train_coda.py      Two-phase training pipeline
-  run_suite.py       Perf benchmarks (5 configs, JSON output)
-  eval_eve.py        Eve-2 integration eval
-  bench.py           Quick single-config timing
+  train_coda.py           Two-phase training pipeline
+  run_suite.py            Perf benchmarks (5 configs, JSON output)
+  eval_llm.py             Full-model perplexity evaluation
+  run_ablation_h100.sh    Differential attention ablation
 
-tests/               60 tests
+tests/                    56 tests
 ```
 
 ## Metrics
@@ -267,19 +271,28 @@ print(state.metrics)
 
 Zero overhead when disabled (default).
 
+## Custom Triton kernels
+
+Two fused kernels address throughput bottlenecks (verified on H200 NVL with Triton 3.4.0):
+
+- **`triton_diff_flash`** -- Fused differential FlashAttention forward kernel. Single HBM pass computes both signal and noise attention with online softmax, applies the differential epilogue and optional HeadwiseRMSNorm in-register.
+- **`triton_bank_routing`** -- Fused exact-bank routing kernel replacing ~15 PyTorch micro-kernel launches (matmul, mean, max, masked_fill, topk, cumsum, clamp, gather, scatter, where) with a single deterministic GPU kernel.
+
+Install with: `pip install coda-gqa-l[triton]`
+
 ## Limitations
 
-- 2x attention FLOPs from dual-stream differential attention. No fused Triton kernel yet.
-- Fine-tuning required. Cold-swap doesn't work -- differential attention reshapes activations.
-- Phase 2 training is ~20x slower than Phase 1 (gradient flow through bank updates).
-- ~30-45% PPL gap between bounded and unbounded. Real information loss from context compression.
+- 2x attention FLOPs from dual-stream differential attention. Fused Triton forward kernel partially addresses this; backward pass kernel is future work.
+- Fine-tuning required. Cold-swap doesn't work -- differential attention reshapes activations (cold-swap PPL: 2,464).
+- +23.5% PPL gap between bounded and unbounded at 7B scale. Real information loss from context compression.
+- Configuration sensitivity: the bounded config used at inference must match training (large-cache trained with medium yields worse PPL).
 - No distributed cache sharding. No quantized KV storage.
 
 ## Links
 
-- Paper: [Zenodo]
-- Trained weights: [HuggingFace]
-- Technical deep-dive: [HuggingFace article]
+- Paper: [arXiv / Preprint](https://github.com/anthony-maio/CoDA-GQA-L/tree/main/paper)
+- Trained weights: [anthonym21/Mistral-7B-v0.3-CoDA-GQA-L](https://huggingface.co/anthonym21/Mistral-7B-v0.3-CoDA-GQA-L)
+- PyPI: `pip install coda-gqa-l`
 
 ## Citation
 
