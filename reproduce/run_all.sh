@@ -65,25 +65,43 @@ echo "--- Step 4: Needle retention ---"
 python examples/needle_demo.py 2>&1 | tee "$RESULTS_DIR/needle_demo.log"
 
 # --- Step 5: Training + trained eval (opt-in) ---
+# --- Step 5: Download published checkpoint OR train from scratch ---
+ADAPTER_PATH="${ADAPTER_PATH:-}"
+
 if [[ "${TRAIN:-0}" == "1" ]]; then
     echo ""
-    echo "--- Step 5: Training (Phase 1 + Phase 2) ---"
+    echo "--- Step 5: Training (Phase 1 + Phase 2, seq_len=8192) ---"
     python benchmarks/train_coda.py --model "$MODEL" \
-        --max-steps 2000 --bounded-steps 1000 --bounded-config medium \
-        --batch-size 2 --grad-accum 4 --output-dir "$RESULTS_DIR/training"
+        --max-steps 2000 --bounded-steps 600 --bounded-config medium \
+        --seq-len 8192 --batch-size 1 --grad-accum 8 \
+        --head-norm-mode identity --dtype bf16 \
+        --output-dir "$RESULTS_DIR/training"
 
+    ADAPTER_PATH="$RESULTS_DIR/training/phase2/best/coda_adapters.pt"
+else
+    # Download published checkpoint
+    echo ""
+    echo "--- Step 5: Downloading published checkpoint ---"
+    ADAPTER_PATH=$(python -c "
+from huggingface_hub import hf_hub_download
+print(hf_hub_download('anthonym21/Mistral-7B-v0.3-CoDA-GQA-L', 'coda_adapters.pt'))
+")
+    echo "  Checkpoint: $ADAPTER_PATH"
+fi
+
+if [[ -n "$ADAPTER_PATH" && -f "$ADAPTER_PATH" ]]; then
     echo ""
     echo "--- Step 6: Trained model evaluation ---"
     python benchmarks/eval_llm.py --model "$MODEL" --experiment perplexity \
-        --adapter-weights "$RESULTS_DIR/training/best" \
+        --adapter-weights "$ADAPTER_PATH" \
         --head-norm-mode identity --dtype bf16 --results-dir "$RESULTS_DIR"
 
     echo ""
     echo "--- Step 7: Memory bank config ablation ---"
     python benchmarks/eval_llm.py --model "$MODEL" --experiment perplexity \
         --bounded-configs window-only,tiny,medium,large \
-        --adapter-weights "$RESULTS_DIR/training/best" \
-        --dtype bf16 --results-dir "$RESULTS_DIR"
+        --adapter-weights "$ADAPTER_PATH" \
+        --head-norm-mode identity --dtype bf16 --results-dir "$RESULTS_DIR"
 fi
 
 # --- Render tables ---

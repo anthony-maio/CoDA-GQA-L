@@ -1,0 +1,25 @@
+# CoDA-GQA-L reproducibility requirements
+# Tested on: NVIDIA H200 NVL (140GB), CUDA 12.8, Python 3.12
+#
+# Install:
+#   pip install -e .
+#   pip install -r reproduce/requirements.txt
+
+# Core (already in pyproject.toml)
+torch>=2.0
+
+# HuggingFace ecosystem (model loading, datasets, eval)
+transformers>=4.40
+accelerate>=0.27
+datasets>=2.18
+huggingface_hub>=0.21
+
+# Triton kernels (optional — CUDA-only, not available on CPU/macOS)
+# triton>=3.0
+
+# Notebook execution
+jupyter>=1.0
+ipykernel>=6.0
+
+# Testing
+pytest>=7.0

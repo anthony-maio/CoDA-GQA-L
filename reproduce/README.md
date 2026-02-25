@@ -1,153 +1,194 @@
-# Reproducing CoDA-GQA-L results
+# Reproducing CoDA-GQA-L Results
 
-This directory contains instructions and scripts to reproduce every experiment in the paper. All commands assume you're at the repo root.
+This directory contains everything needed to reproduce every experiment in the paper.
 
-## Setup
+## Contents
+
+| File | Description |
+|------|-------------|
+| `reproduce_results.ipynb` | Clean notebook reproducing all results (recommended) |
+| `run_all.sh` | One-command shell script for all experiments |
+| `configs.json` | Machine-readable experiment configurations |
+| `requirements.txt` | Python dependencies |
+
+## Quick Start
 
 ```bash
+# From repo root
 pip install -e .
-pip install transformers datasets accelerate huggingface_hub
+pip install -r reproduce/requirements.txt
+
+# Option A: Run the notebook
+jupyter notebook reproduce/reproduce_results.ipynb
+
+# Option B: Run everything from the command line
+bash reproduce/run_all.sh                     # eval-only (~30 min)
+TRAIN=1 bash reproduce/run_all.sh             # with training (~6 hours)
 ```
 
-Hardware: 8+ GB VRAM for SmolLM2-135M experiments, 40+ GB for Mistral-7B (H100 or A100 recommended).
+## Pre-trained Checkpoint (Skip Training)
 
-## Quick smoke test (~5 min, any GPU)
+Our trained Mistral-7B checkpoint is available on HuggingFace:
 
-Verify that CoDA weight transfer works and training runs without errors:
+```python
+from huggingface_hub import hf_hub_download
+adapter_path = hf_hub_download("anthonym21/Mistral-7B-v0.3-CoDA-GQA-L", "coda_adapters.pt")
+```
+
+Using the published checkpoint, you can reproduce all eval results (Tables 1-3, needle, ablations) without any GPU training time.
+
+## Hardware Requirements
+
+| Experiment | VRAM | Time | Notes |
+|-----------|------|------|-------|
+| Smoke test (SmolLM2-135M) | 8GB | 5 min | Any GPU |
+| Cold-swap PPL | 24GB+ | 30 min | No training |
+| Trained model eval | 24GB+ | 30 min | Uses published checkpoint |
+| Throughput benchmarks | Any | 2 min | Standalone test model |
+| Needle-in-haystack | Any | 1 min | Standalone test model |
+| Two-phase training | 40GB+ | 3-6 hrs | H100/H200 recommended |
+| Diff attn ablation | 40GB+ | ~4 hrs | H100/H200 recommended |
+
+**Verified hardware**: NVIDIA H200 NVL (140GB), CUDA 12.8, PyTorch 2.8, Triton 3.4.
+
+## Expected Results
+
+### Perplexity (WikiText-2, Mistral-7B)
+
+| Configuration | PPL | vs Baseline | KV Cache |
+|--------------|----:|----------:|-------:|
+| Baseline | 4.81 | -- | O(L) |
+| CoDA unbounded | 5.38 | +11.7% | O(L) |
+| Bounded medium | 5.94 | +23.5% | 218KB |
+| Bounded tiny | 6.31 | +31.2% | 109KB |
+| Window-only | 6.22 | +29.3% | 129KB |
+
+### Context-Length Scaling (bounded medium, 8K-trained)
+
+| Context | 512 | 1024 | 2048 | 4096 | 8192 |
+|---------|----:|-----:|-----:|-----:|-----:|
+| PPL | 6.36 | 6.09 | 5.94 | 5.95 | 6.87 |
+
+### Needle-in-Haystack
+
+100% retention at 256, 1K, 4K, and 16K tokens (cosine similarity >= 0.999).
+
+### Differential Attention Ablation
+
+| Model | Bounded PPL |
+|-------|------------:|
+| GQA + bounded (no diff attn) | 5.81 |
+| CoDA + bounded (diff attn) | 5.56 |
+
+Differential attention improves bounded PPL by 4.3%.
+
+---
+
+## Experiment Details
+
+### 1. Smoke test (~5 min, any GPU)
+
+Verify weight transfer correctness on SmolLM2-135M:
 
 ```bash
-# Forward equivalence: proves weight mapping is correct
 python benchmarks/eval_llm.py --model HuggingFaceTB/SmolLM2-135M \
     --experiment forward-check --dtype fp32
-
-# Short training run
-python benchmarks/train_coda.py --model HuggingFaceTB/SmolLM2-135M \
-    --max-steps 200 --eval-every 100
 ```
 
-## Table 1: Cold-swap perplexity
+### 2. Cold-swap perplexity (no training)
 
-No training needed. Swaps attention layers and measures PPL degradation.
-Use `--dtype fp32` for accurate cold-swap results (bf16 rounding compounds through 30+ layers).
+Measures structural overhead of swapping attention layers without fine-tuning.
+Use `--dtype fp32` for cold-swap (bf16 rounding compounds through 32 layers):
 
 ```bash
-# SmolLM2-135M (~10 min)
-python benchmarks/eval_llm.py --model HuggingFaceTB/SmolLM2-135M \
-    --experiment perplexity --dtype fp32
-
-# Mistral-7B-v0.3 (~30 min, needs 24+ GB VRAM)
 python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 \
     --experiment perplexity --dtype fp32
 ```
 
-Results saved to `results/` as JSON with baseline, unbounded, and bounded PPL.
+### 3. Two-phase training
 
-## Table 2: Fine-tuned perplexity
+**Phase 1** (unbounded, 2000 steps): teaches differential attention.
+**Phase 2** (bounded, 600 steps): adapts to fixed KV cache.
 
-Two-phase training: Phase 1 (unbounded) teaches differential attention, Phase 2 (bounded) adapts to limited KV cache.
+Training at `--seq-len 8192` is critical. Models trained at 2048 show catastrophic PPL blowup at longer contexts.
 
 ```bash
-# Train Mistral-7B (~3-6 hours on H100)
+# Full training from scratch (~3-6 hours, 40GB+ VRAM)
 python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 \
-    --max-steps 2000 --bounded-steps 1000 --bounded-config medium \
-    --batch-size 2 --grad-accum 4 --output-dir results/mistral7b_train
+    --max-steps 2000 --bounded-steps 600 --bounded-config medium \
+    --seq-len 8192 --batch-size 1 --grad-accum 8 \
+    --head-norm-mode identity --dtype bf16 \
+    --output-dir results/training
 
-# Evaluate trained model
+# Resume Phase 2 from published Phase 1 checkpoint
+python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 \
+    --adapter-weights path/to/coda_adapters.pt \
+    --max-steps 0 --bounded-steps 600 --bounded-config medium \
+    --seq-len 8192 --batch-size 1 --grad-accum 8 \
+    --head-norm-mode identity --dtype bf16 \
+    --output-dir results/phase2_only
+```
+
+Note: gradient checkpointing is automatically disabled for Phase 2 (in-place state ops are incompatible).
+
+### 4. Trained model evaluation
+
+```bash
 python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 \
     --experiment perplexity \
-    --adapter-weights results/mistral7b_train/best \
+    --adapter-weights path/to/coda_adapters.pt \
     --head-norm-mode identity --dtype bf16
 ```
 
-Training configs: `--freeze attention` (default, ~20% params trainable), `--freeze coda-only` (~50K params, fastest).
+### 5. Throughput & KV cache memory
 
-## Table 3: Throughput and KV cache memory
-
-Standalone benchmark -- no trained model needed. Compares 5 attention configs:
+Standalone benchmark (no trained model needed):
 
 ```bash
 python benchmarks/run_suite.py
 python benchmarks/render_tables.py
 ```
 
-Configs: baseline GQA, CoDA unbounded, tiny-cache (W=128/Me=32/Ms=32), medium-cache (W=256/Me=64/Ms=64), window-only (W=256/Me=0/Ms=0).
-
-## Needle-in-haystack retention
-
-Verifies that important tokens survive eviction from the recent window via the exact memory bank:
+### 6. Needle-in-haystack retention
 
 ```bash
 python examples/needle_demo.py
 RUN_LONG=1 python examples/needle_demo.py  # includes L=16384
 ```
 
-## Ablation: Differential attention contribution
+### 7. Ablation: differential attention
 
-The key ablation question: does differential attention actually help, or would standard GQA with the same bounded memory banks achieve similar PPL?
-
-This script trains two Mistral-7B configs head-to-head on an H100:
-1. Standard GQA + bounded cache (no differential attention, `--no-differential`)
-2. CoDA + bounded cache (with differential attention)
+Train two Mistral-7B configs head-to-head:
 
 ```bash
-bash benchmarks/run_ablation_h100.sh
+# GQA + bounded (no differential attention)
+python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 \
+    --max-steps 0 --bounded-steps 1200 --no-differential \
+    --bounded-config medium --seq-len 2048 \
+    --batch-size 1 --grad-accum 8 --head-norm-mode identity \
+    --output-dir results/ablation_gqa
+
+# CoDA + bounded (full differential attention)
+python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 \
+    --max-steps 1200 --bounded-steps 1200 \
+    --bounded-config medium --seq-len 2048 \
+    --batch-size 1 --grad-accum 8 --head-norm-mode identity \
+    --output-dir results/ablation_coda
 ```
 
-See [benchmarks/run_ablation_h100.sh](../benchmarks/run_ablation_h100.sh) for full details. Designed for RunPod `/workspace`. Results go to `/workspace/ablation_results/`.
+Or use the provided script: `bash benchmarks/run_ablation_h100.sh`
 
-## Ablation: Memory bank configurations
-
-Sweep bounded configs to measure the contribution of exact and summary banks:
+### 8. Ablation: memory bank configurations
 
 ```bash
 python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 \
     --experiment perplexity \
     --bounded-configs window-only,tiny,medium,large \
-    --adapter-weights results/mistral7b_train/best --dtype bf16
+    --adapter-weights path/to/coda_adapters.pt \
+    --head-norm-mode identity --dtype bf16
 ```
 
-Configs: window-only (no banks), tiny (W=128+Me=32+Ms=32), medium (W=256+Me=64+Ms=64), large (W=512+Me=128+Ms=128).
-
-## Memory bank metrics
-
-Collect hit rates, fill ratios, and eviction counts during bounded generation:
-
-```bash
-python examples/bounded_generate.py --collect-metrics --max-new-tokens 500
-```
-
-## Eve-2 integration (optional)
-
-Benchmarks against the Eve-2 MoE architecture (272M params, D=512, H=8):
-
-```bash
-python benchmarks/eval_eve.py --experiment forward-check
-python benchmarks/eval_eve.py --experiment perplexity
-python benchmarks/eval_eve.py --experiment needle
-python benchmarks/eval_eve.py --experiment all
-```
-
-## One-command runner
-
-Run all non-training experiments with a single command:
-
-```bash
-bash reproduce/run_all.sh
-```
-
-To include training (adds several hours of GPU time):
-
-```bash
-TRAIN=1 bash reproduce/run_all.sh
-```
-
-Override the model:
-
-```bash
-MODEL=HuggingFaceTB/SmolLM2-135M bash reproduce/run_all.sh
-```
-
-## Script reference
+## Script Reference
 
 | Script | What it does | Time |
 |--------|-------------|------|
@@ -157,10 +198,9 @@ MODEL=HuggingFaceTB/SmolLM2-135M bash reproduce/run_all.sh
 | `benchmarks/render_tables.py` | Render results/*.json as markdown tables | seconds |
 | `benchmarks/forward_check_generic.py` | Weight transfer validation | ~1 min |
 | `benchmarks/run_ablation_h100.sh` | GQA vs CoDA ablation (H100) | ~4 hours |
-| `benchmarks/eval_eve.py` | Eve-2 integration benchmarks | 10-30 min |
 | `examples/needle_demo.py` | Needle-in-haystack retention | ~1 min |
 | `examples/bounded_generate.py` | Bounded text generation with metrics | ~1 min |
 
-## Output format
+## Output Format
 
 All eval scripts write JSON results to `results/`. Each JSON includes system metadata (GPU, CUDA version, PyTorch version, dtype, timestamp) alongside the experiment results. Use `benchmarks/render_tables.py` to produce markdown comparison tables from these JSONs.

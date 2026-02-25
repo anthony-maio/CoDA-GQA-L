@@ -16,8 +16,10 @@
   },
   "table2_finetuned_ppl": {
     "description": "Fine-tuned perplexity (Table 2) -- requires GPU hours",
-    "train": "python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 --max-steps 2000 --bounded-steps 1000 --bounded-config medium --batch-size 2 --grad-accum 4 --output-dir results/mistral7b_train",
-    "eval": "python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 --experiment perplexity --adapter-weights results/mistral7b_train/best --head-norm-mode identity --dtype bf16"
+    "train": "python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 --max-steps 2000 --bounded-steps 600 --bounded-config medium --seq-len 8192 --batch-size 1 --grad-accum 8 --head-norm-mode identity --dtype bf16 --output-dir results/training",
+    "eval": "python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 --experiment perplexity --adapter-weights results/training/phase2/best/coda_adapters.pt --head-norm-mode identity --dtype bf16",
+    "checkpoint": "anthonym21/Mistral-7B-v0.3-CoDA-GQA-L",
+    "notes": "Training at seq_len=8192 is critical. Models trained at 2048 show catastrophic PPL blowup beyond training length."
   },
   "table3_throughput": {
     "description": "Throughput and KV cache memory (Table 3)",
@@ -27,33 +29,30 @@
     ]
   },
   "ablation_diff_attn": {
-    "description": "Differential attention contribution ablation -- GQA+bounded vs CoDA+bounded (H100 recommended, ~4 hours)",
+    "description": "Differential attention contribution -- GQA+bounded vs CoDA+bounded (~4 hours)",
+    "commands": [
+      "python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 --max-steps 0 --bounded-steps 1200 --no-differential --bounded-config medium --seq-len 2048 --batch-size 1 --grad-accum 8 --head-norm-mode identity --dtype bf16 --output-dir results/ablation_gqa",
+      "python benchmarks/train_coda.py --model mistralai/Mistral-7B-v0.3 --max-steps 1200 --bounded-steps 1200 --bounded-config medium --seq-len 2048 --batch-size 1 --grad-accum 8 --head-norm-mode identity --dtype bf16 --output-dir results/ablation_coda"
+    ],
     "script": "benchmarks/run_ablation_h100.sh",
-    "notes": "Trains two Mistral-7B configs head-to-head: standard GQA with bounded cache (--no-differential) vs full CoDA with bounded cache. 1200 steps each."
+    "expected": {"gqa_bounded_ppl": 5.81, "coda_bounded_ppl": 5.56, "improvement": "4.3%"}
   },
   "ablation_memory_banks": {
     "description": "Memory bank config sweep -- window-only vs tiny vs medium vs large",
-    "command": "python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 --experiment perplexity --bounded-configs window-only,tiny,medium,large --adapter-weights results/mistral7b_train/best --dtype bf16",
-    "notes": "Requires trained adapter weights from table2_finetuned_ppl."
+    "command": "python benchmarks/eval_llm.py --model mistralai/Mistral-7B-v0.3 --experiment perplexity --bounded-configs window-only,tiny,medium,large --adapter-weights path/to/coda_adapters.pt --head-norm-mode identity --dtype bf16",
+    "notes": "Requires trained adapter weights. Use published checkpoint or train with table2_finetuned_ppl."
   },
   "needle_retention": {
     "description": "Needle-in-haystack retention (~1 min)",
     "commands": [
       "python examples/needle_demo.py",
       "RUN_LONG=1 python examples/needle_demo.py"
-    ]
+    ],
+    "expected": "100% retention at 256, 1K, 4K, 16K tokens with cosine >= 0.999"
   },
-  "bounded_generation_metrics": {
-    "description": "Memory bank hit rates and fill ratios during generation",
-    "command": "python examples/bounded_generate.py --collect-metrics --max-new-tokens 500"
-  },
-  "eve2_integration": {
-    "description": "Eve-2 MoE integration benchmarks (optional)",
-    "commands": [
-      "python benchmarks/eval_eve.py --experiment forward-check",
-      "python benchmarks/eval_eve.py --experiment perplexity",
-      "python benchmarks/eval_eve.py --experiment needle",
-      "python benchmarks/eval_eve.py --experiment all"
-    ]
+  "context_scaling": {
+    "description": "Context-length scaling evaluation (512-8192 tokens)",
+    "notes": "Run via reproduce_results.ipynb Section 5 or implement with eval_bounded_ppl() helper.",
+    "expected": {"512": 6.36, "1024": 6.09, "2048": 5.94, "4096": 5.95, "8192": 6.87}
   }
 }
