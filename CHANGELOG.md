@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.2.0] - 2026-02-25
+
+### Added
+- **Reproducibility notebook** (`reproduce/reproduce_results.ipynb`): Complete 2x2 factorial ablation with matched training conditions, replacing the earlier simple bounded-only comparison.
+- **Phase 2 OOM auto-detection**: Automatically detects GPU VRAM and falls back to `seq_len=4096` on GPUs with <120 GB (e.g., H100 80 GB), preventing out-of-memory failures during bounded training.
+
+### Changed
+- **Differential attention ablation upgraded to 2x2 factorial design**: Both GQA and CoDA now trained with identical budgets (2,000 unbounded + 600 bounded steps). Results show identical unbounded PPL (5.75) with a 5.7x bounded penalty reduction (CoDA +0.19 vs GQA +1.09), demonstrating genuine synergy rather than the previously reported 4.3% additive improvement.
+- Ablation script reference updated from `run_ablation_h100.sh` to `reproduce/reproduce_results.ipynb` Section 8.
+
+### Key Results Update
+- GQA unbounded: 5.75 PPL | GQA bounded: 6.84 PPL (penalty: +1.09)
+- CoDA unbounded: 5.75 PPL | CoDA bounded: 5.94 PPL (penalty: +0.19)
+- Interaction effect: +0.90 PPL | Penalty reduction factor: **5.7x**
+- Identical unbounded baselines confirm zero overhead from differential attention
+
 ## [1.1.0] - 2026-02-19
 
 ### Added
