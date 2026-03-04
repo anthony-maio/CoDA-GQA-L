@@ -6,13 +6,13 @@
 pip install coda-gqa-l
 ```
 
-A 70B model serving 128K context burns 160 GB on KV cache alone. CoDA-GQA-L does it in 136 MB -- a fixed-size buffer that doesn't grow no matter how long the input is.
+A 70B model serving 128K context burns 160 GB on KV cache alone. CoDA-GQA-L does it in 120 MB -- a fixed-size buffer that doesn't grow no matter how long the input is.
 
 | Context | Standard KV (70B, 80 layers) | CoDA-GQA-L | Compression |
 |---------|------------------------------|------------|-------------|
-| 2K      | 2.56 GB                      | 136 MB     | 18.8x       |
-| 32K     | 40 GB                        | 136 MB     | 294x        |
-| 128K    | 160 GB                       | 136 MB     | **1,176x**  |
+| 2K      | 2.56 GB                      | 120 MB     | 21.3x       |
+| 32K     | 40 GB                        | 120 MB     | 341x        |
+| 128K    | 160 GB                       | 120 MB     | **1,365x**  |
 
 The mechanism replaces the O(L) KV cache with three fixed-size segments per layer:
 
@@ -22,17 +22,17 @@ The mechanism replaces the O(L) KV cache with three fixed-size segments per laye
 
 384 slots per layer, always, whether you processed 2K or 128K tokens.
 
-The bounded state is serializable. `torch.save()` it, load it a week later, query it without re-reading the original document. At 7B scale each state is 54 MB. We call this pattern **stateful neural databases**.
+The bounded state is serializable. `torch.save()` it, load it a week later, query it without re-reading the original document. At 7B scale each state is 48 MB. We call this pattern **stateful neural databases**.
 
 ## How it works
 
 Three ideas, briefly:
 
-**Differential attention via orthogonal rotation.** Builds on Microsoft's Diff Transformer (Ye et al., 2024) but drops the second Wq projection. A learned per-head rotation produces the noise query from the signal query. Signal minus gated noise, one SDPA call (head-stacked), HeadwiseRMSNorm on the output.
+**Differential attention via orthogonal rotation.** Builds on Microsoft's Diff Transformer (Ye et al., 2024) but drops the second Wq projection. A learned per-head rotation produces the noise query from the signal query. Signal minus gated noise, one SDPA call (head-stacked), HeadwiseRMSNorm on the output. A 2x2 factorial ablation shows CoDA adds zero overhead unbounded but reduces the bounded penalty by 5.7x.
 
 **Value-routing.** Keys have RoPE baked in and their cosine similarity is position-dependent -- same word at position 100 vs 5000 looks orthogonal in key-space. Memory banks route on Values instead (RoPE-free, pure semantic content). This is what makes deduplication and EMA blending actually work.
 
-**Two-phase training.** Phase 1 trains unbounded differential attention. Phase 2 switches to bounded cache with gradient flow through evictions so the write gate learns what to keep. Without Phase 2, bounded eval is catastrophic (PPL 5.62 to 2,464 on Mistral 7B).
+**Two-phase training.** Phase 1 trains unbounded differential attention. Phase 2 switches to bounded cache with gradient flow through evictions so the write gate learns what to keep. Without Phase 2, bounded eval is catastrophic (PPL 5.75 to 2,464 on Mistral 7B).
 
 ## Quick start
 
@@ -82,7 +82,7 @@ state = torch.load("document_42.pt")
 answer, state = attn.step(query_embedding, state)
 ```
 
-At 7B scale (32 layers): 54 MB per document state. 100 documents = 5.4 GB. Route queries to the right state on demand -- no vector database, no chunk-and-retrieve.
+At 7B scale (32 layers): 48 MB per document state. 100 documents = 4.8 GB. Route queries to the right state on demand -- no vector database, no chunk-and-retrieve.
 
 ## Drop-in model adapters
 
@@ -117,21 +117,21 @@ python benchmarks/train_coda.py \
     --model HuggingFaceTB/SmolLM2-135M \
     --max-steps 200 --bounded-steps 100 --bounded-config medium
 
-# Mistral 7B (~6 hours on H100)
+# Mistral 7B (~1.6 hours on H200)
 python benchmarks/train_coda.py \
     --model mistralai/Mistral-7B-v0.3 \
-    --max-steps 2000 --bounded-steps 2000 \
+    --max-steps 2000 --bounded-steps 600 \
     --bounded-lr-scale 0.5 --bounded-block-size 128 \
     --no-detach-evicted --batch-size 1 --grad-accum 8
 ```
 
 **Bounded configs:**
 
-| Config | Window | Exact | Summary | Total slots |
-|--------|--------|-------|---------|-------------|
-| tiny   | 128    | 32    | 32      | 192         |
-| medium | 256    | 64    | 64      | 384         |
-| large  | 512    | 128   | 128     | 768         |
+| Config | Window | Exact | Summary | Total slots | KV Cache/Layer |
+|--------|--------|-------|---------|-------------|----------------|
+| tiny   | 128    | 32    | 32      | 192         | 108.9 KB       |
+| medium | 256    | 64    | 64      | 384         | 217.9 KB       |
+| large  | 512    | 128   | 128     | 768         | 3.0 MB         |
 
 ### Training results (Mistral-7B-v0.3 on H200 NVL)
 
@@ -140,13 +140,50 @@ python benchmarks/train_coda.py \
 | Phase 1 (unbounded) | 2,000 | 23.50 | 5.75 | ~4,950 tok/s |
 | Phase 2 (bounded, medium) | 600 | 27.88 | 6.31 | ~2,000 tok/s |
 
-**23.5% PPL overhead** (+1.13 PPL) vs. the 4.81 baseline for **9.5x memory compression**. Context-length scaling is remarkably flat: 5.94 at 2K, 5.95 at 4K. Total training time: ~1.6 hours on H200.
+**23.5% PPL overhead** (+1.13 PPL) vs. the 4.81 baseline for **9.5x memory compression**. Total training time: ~1.6 hours on H200.
 
 Phase 2 trains with `detach_evicted=False` so gradients flow through bank updates.
 
+### Context-length scaling
+
+Context-length degradation is remarkably flat between 1K and 4K:
+
+| Context | Bounded PPL | vs 2K |
+|---------|-------------|-------|
+| 512     | 6.36        | +7.1% |
+| 1,024   | 6.09        | +2.5% |
+| 2,048   | 5.94        | ---   |
+| 4,096   | 5.95        | +0.2% |
+| 8,192   | 6.87        | +15.7% |
+
+The model was trained at seq_len=8,192. Bounded PPL at 2K (5.94) and 4K (5.95) is nearly identical.
+
+### Differential attention ablation (2x2 factorial)
+
+A 2x2 factorial ablation isolates the interaction between differential attention and bounded memory. Both methods achieve identical unbounded PPL, but CoDA's bounded penalty is 5.7x smaller:
+
+| Method | Unbounded PPL | Bounded PPL | Bounded Penalty |
+|--------|---------------|-------------|-----------------|
+| Standard GQA (no diff. attn) | 5.75 | 6.84 | +1.09 |
+| CoDA (differential attn)     | 5.75 | 5.94 | +0.19 |
+
+**Interaction effect: +0.90 PPL. Penalty reduction: 5.7x.** Differential attention adds zero overhead unbounded but reduces the information loss from context compression by nearly 6x. The two innovations are designed to work together.
+
+### Dynamic bank expansion
+
+Memory banks can be expanded at inference time (64 to 128 slots per bank) without retraining:
+
+| Context | Fixed PPL (384 slots) | Expanded PPL (512 slots) | Improvement |
+|---------|-----------------------|--------------------------|-------------|
+| 2,048   | 5.94                  | 5.94                     | 0.0%        |
+| 4,096   | 5.95                  | 5.96                     | -0.2%       |
+| 8,192   | 6.87                  | 6.80                     | +1.0%       |
+
+Marginal benefit at 8K. A model trained *with* expansion (medium-expand config) achieves 5.81 PPL.
+
 ## Benchmarks
 
-All numbers from H200 NVL, bf16, standalone attention modules.
+All numbers from H200 NVL, bf16.
 
 ```bash
 python benchmarks/run_suite.py                          # 5 configs, JSON output
@@ -155,30 +192,36 @@ python benchmarks/run_suite.py --embed-dim 4096 \       # 7B scale
 python benchmarks/render_tables.py                      # markdown tables
 ```
 
-### Memory (per layer, medium-cache W=256 Me=64 Ms=64)
+### Memory (Mistral-7B, per layer, medium-cache W=256 Me=64 Ms=64)
 
-| Scale | Standard KV | CoDA bounded | Compression |
-|-------|-------------|--------------|-------------|
-| 7B (D=4096, H=32, Hkv=8)  | 32.0 MB | 1.7 MB | 18.8x |
-| 70B (D=8192, H=64, Hkv=8) | 32.0 MB | 1.7 MB | 18.8x |
+| Seq Length | Standard KV | CoDA bounded | Compression |
+|------------|-------------|--------------|-------------|
+| 512        | 2.0 MB      | 1.5 MB       | 1.3x        |
+| 1,024      | 4.0 MB      | 1.5 MB       | 2.7x        |
+| 2,048      | 8.0 MB      | 1.5 MB       | 5.3x        |
+| 4,096      | 16.0 MB     | 1.5 MB       | 10.7x       |
+| 8,192      | 32.0 MB     | 1.5 MB       | 21.3x       |
 
-Across all layers at 128K context:
+Across all layers:
 
-| Model | Standard KV total | CoDA total | Compression |
-|-------|-------------------|------------|-------------|
-| 7B (32 layers)  | 64 GB  | 54 MB  | **1,185x** |
-| 70B (80 layers) | 160 GB | 136 MB | **1,176x** |
+| Scenario | Standard KV | CoDA total | Compression |
+|----------|-------------|------------|-------------|
+| 7B, 2K ctx (32 layers)    | 512 MB  | 48 MB  | 10.7x       |
+| 7B, 128K ctx (32 layers)  | 32 GB   | 48 MB  | **682x**    |
+| 70B, 2K ctx (80 layers)   | 2.56 GB | 120 MB | 21.3x       |
+| 70B, 128K ctx (80 layers) | 160 GB  | 120 MB | **1,365x**  |
 
-### Throughput (70B scale, tokens/sec)
+### Throughput (D=512 test model, H200 NVL)
 
-| Config | Prefill 2K | Prefill 8K | Decode | Peak VRAM |
-|--------|----------:|----------:|-------:|----------:|
-| Baseline GQA       | 1,336,349 | 966,464 | 4,676 | 1.1 GB   |
-| CoDA unbounded     | 889,203   | 598,314 | 2,914 | 1.6 GB   |
-| CoDA medium-cache  | 149,832   | 153,716 | 1,753 | 568.6 MB |
-| CoDA window-only   | 359,417   | 356,026 | 1,773 | 546.0 MB |
+| Config | Prefill @4096 | Decode | KV Cache | Peak VRAM |
+|--------|-------------:|-------:|---------:|----------:|
+| Baseline GQA       | 15.2M tok/s | 5,504 tok/s | 2.0 MB  | 59.8 MB |
+| CoDA unbounded     | 8.0M tok/s  | 3,449 tok/s | 2.0 MB  | 75.9 MB |
+| CoDA medium-cache  | 210K tok/s  | 2,283 tok/s | 218 KB  | 52.0 MB |
+| CoDA window-only   | 664K tok/s  | 2,298 tok/s | 129 KB  | 51.9 MB |
+| CoDA tiny-cache    | 206K tok/s  | 833 tok/s   | 109 KB  | 51.9 MB |
 
-Bounded prefill throughput is flat (~150K tok/s) regardless of sequence length. Baseline drops 28% from 2K to 8K. Bounded VRAM is 1.9x lower.
+Bounded prefill throughput is flat regardless of sequence length. Bounded VRAM is lower than unbounded (52 MB vs 76 MB) because the smaller KV cache more than offsets differential attention overhead.
 
 ## Architecture
 
@@ -225,7 +268,7 @@ Bounded is mathematically identical to unbounded when W >= L (no evictions):
 | 1024 | 1024 | 1.5e-7 |
 | 2048 | 2048 | 1.8e-7 |
 
-56 tests covering correctness, determinism, edge configs, invariants, and backward pass safety.
+60 tests covering correctness, determinism, edge configs, invariants, and backward pass safety.
 
 ```bash
 python -m pytest tests/ -v
@@ -251,7 +294,7 @@ benchmarks/
   eval_llm.py             Full-model perplexity evaluation
   run_ablation_h100.sh    Differential attention ablation
 
-tests/                    56 tests
+tests/                    60 tests
 ```
 
 ## Metrics
@@ -298,8 +341,8 @@ Install with: `pip install coda-gqa-l[triton]`
 
 ```bibtex
 @software{coda_gqa_l_2026,
-  title  = {CoDA-GQA-L: Bounded-Memory Differential Attention
-            with Value-Routed Landmark Banks},
+  title  = {CoDA-GQA-L: Constrained Orthogonal Differential Attention
+            with Grouped-Query Value-Routed Landmark Banks},
   author = {Maio, Anthony},
   year   = {2026},
 }
