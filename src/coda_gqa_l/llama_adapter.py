@@ -399,6 +399,10 @@ class LlamaCoDAAdapter(nn.Module):
     def get_state(self) -> Optional[CoDAGQALandmarkStatePerf2]:
         return self._state
 
+    def set_state(self, state: CoDAGQALandmarkStatePerf2) -> None:
+        """Restore a previously saved inference state."""
+        self._state = state
+
     def reset_state(self) -> None:
         self._state = None
 

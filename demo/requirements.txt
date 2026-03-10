@@ -1,0 +1,6 @@
+torch>=2.0
+transformers>=4.40
+accelerate>=0.25
+huggingface-hub>=0.20
+gradio>=5.0
+git+https://github.com/anthony-maio/CoDA-GQA-L.git

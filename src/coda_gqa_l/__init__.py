@@ -17,6 +17,7 @@ from .baseline import BaselineGQA, CoDAGQA
 from .eve_adapter import EveCoDAAdapter
 from .llama_adapter import LlamaCoDAAdapter
 from .memory_banks import MemoryBankMixin
+from .neural_db import NeuralDatabase
 from .qwen3_adapter import Qwen3CoDAAdapter
 from .primitives import HeadwiseRMSNorm, RotaryEmbedding, apply_rope, repeat_kv
 from .state import CoDAGQALandmarkStatePerf2
@@ -28,6 +29,7 @@ __all__ = [
     "BaselineGQA",
     "EveCoDAAdapter",
     "LlamaCoDAAdapter",
+    "NeuralDatabase",
     "Qwen3CoDAAdapter",
     "HeadwiseRMSNorm",
     "RotaryEmbedding",
