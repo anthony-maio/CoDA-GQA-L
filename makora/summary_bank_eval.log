@@ -1,0 +1,8 @@
+Evaluating code...
+
+✓ Evaluation successful!
+
+Benchmark Results:
+  Reference time: 0.034806 ms
+  Solution time:  0.444710 ms
+  Speedup:        0.08x
