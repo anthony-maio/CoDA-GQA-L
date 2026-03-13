@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import time
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 
 import torch
 
@@ -111,6 +111,34 @@ def _sample_token(
     return torch.multinomial(probs, num_samples=1)
 
 
+def _select_adapter_cls(model: Any) -> Type[Any]:
+    """Pick the right adapter class for a loaded HF model."""
+    from .llama_adapter import LlamaCoDAAdapter
+    from .qwen3_adapter import Qwen3CoDAAdapter
+
+    config = getattr(model, "config", None)
+    model_type = str(getattr(config, "model_type", "") or "").lower()
+    architectures = [
+        str(name).lower() for name in (getattr(config, "architectures", None) or [])
+    ]
+
+    if model_type.startswith("qwen") or any("qwen" in name for name in architectures):
+        return Qwen3CoDAAdapter
+
+    llama_tokens = ("llama", "mistral", "mixtral", "smollm")
+    if (
+        any(token in model_type for token in llama_tokens)
+        or any(any(token in name for token in llama_tokens) for name in architectures)
+    ):
+        return LlamaCoDAAdapter
+
+    raise ValueError(
+        "Unsupported model family for NeuralDatabase. "
+        f"model_type={model_type or 'unknown'}, "
+        f"architectures={architectures or ['unknown']}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # NeuralDatabase
 # ---------------------------------------------------------------------------
@@ -158,10 +186,10 @@ class NeuralDatabase:
         )
 
         # Swap attention layers -> bounded CoDA adapters
-        from .qwen3_adapter import Qwen3CoDAAdapter
+        adapter_cls = _select_adapter_cls(self.model)
+        self.adapter_cls = adapter_cls
 
-        self.adapters: List = Qwen3CoDAAdapter.swap_qwen3_layers(
-            self.model,
+        swap_kwargs = dict(
             bounded=True,
             window=window,
             num_landmarks_exact=num_landmarks_exact,
@@ -169,6 +197,10 @@ class NeuralDatabase:
             block_size=block_size,
             collect_metrics=collect_metrics,
         )
+        if hasattr(adapter_cls, "swap_qwen3_layers"):
+            self.adapters = adapter_cls.swap_qwen3_layers(self.model, **swap_kwargs)
+        else:
+            self.adapters = adapter_cls.swap_llama_layers(self.model, **swap_kwargs)
 
         # Load trained adapter weights if available
         if adapters_file is not None:

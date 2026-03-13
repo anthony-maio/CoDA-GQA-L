@@ -23,6 +23,15 @@ try:
 except ImportError:
     _HAS_TRITON_ROUTE = False
 
+# Triton fused summary-bank update: route + accumulate + EMA in a single
+# kernel pass.  Falls back to PyTorch when unavailable.
+try:
+    from .triton_summary_bank import summary_bank_update as _triton_summary_update
+    from .triton_summary_bank import is_available as _triton_summary_available
+    _HAS_TRITON_SUMMARY = _triton_summary_available()
+except ImportError:
+    _HAS_TRITON_SUMMARY = False
+
 
 class MemoryBankMixin:
     """Memory bank update methods, mixed into CoDAGQALandmarkPerf2.
@@ -791,6 +800,56 @@ class MemoryBankMixin:
         Ms = self.Ms
         As = state.active_summary  # active capacity (may be < Ms)
         device = k_sel.device
+
+        # ── Triton fast path ──────────────────────────────────────────
+        # Fused routing + accumulate + EMA in a single kernel launch.
+        # Skip when training (need autograd), when active < Ms (masking
+        # not yet supported in the kernel), or when Triton unavailable.
+        if (
+            _HAS_TRITON_SUMMARY
+            and not self.training
+            and self.detach_evicted
+            and As == Ms
+            and k_sel.is_cuda
+        ):
+            mem_k, mem_v, used = self._view_sum(state)
+            mem_n = state._sum_lf_k_norm
+
+            mk_out, mv_out, used_out, _ = _triton_summary_update(
+                k_sel, v_sel, w_tok,
+                mem_k, mem_v, used, mem_n,
+                eta_logit=float(self.summary_eta_logit),
+                energy_scale=float(self.energy_scale),
+                lf_start=self.lf_start,
+                overwrite_on_insert=self.summary_overwrite_on_insert,
+            )
+
+            s = self.window + self.Me
+            e = self.Lbuf
+            state.k_buf[:, :, s:e, :] = mk_out
+            state.v_buf[:, :, s:e, :] = mv_out
+            state.allowed[:, s:e] = used_out
+
+            # Update LF-K norm cache for slots that changed
+            lf = self.lf_start
+            changed = used_out & ~used  # newly occupied
+            active_slots = (used_out).any(dim=0).nonzero(as_tuple=True)[0]
+            if active_slots.numel() > 0:
+                state._sum_lf_k_norm[:, :, active_slots, :] = F.normalize(
+                    mk_out[:, :, active_slots, lf:], dim=-1, eps=1e-6
+                )
+
+            if state.metrics is not None:
+                m = state.metrics
+                count_per_slot = used_out.float() - used.float()
+                m["summary_updates"] += int((count_per_slot > 0).sum().item())
+                if self.summary_overwrite_on_insert:
+                    m["summary_inserts"] += int(changed.sum().item())
+                if self.Ms > 0:
+                    m["summary_fill_ratio"] = float(used_out.any(dim=0).float().mean().item())
+            return
+        # ── End Triton fast path ──────────────────────────────────────
+
         sc = self._get_scratch(B, Hkv, Dh, device, k_sel.dtype)
 
         mem_k, mem_v, used = self._view_sum(state)

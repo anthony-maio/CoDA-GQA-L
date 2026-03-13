@@ -15,6 +15,7 @@ import torch
 from coda_gqa_l import CoDAGQALandmarkPerf2, CoDAGQALandmarkStatePerf2
 from coda_gqa_l.neural_db import (
     _deep_copy_state,
+    _select_adapter_cls,
     _state_to_cpu,
     _state_to_device,
 )
@@ -215,3 +216,46 @@ class TestSetState:
         adapter.set_state(state)
         retrieved = adapter.get_state()
         assert retrieved is state
+
+
+# ---------------------------------------------------------------------------
+# Tests: Adapter selection
+# ---------------------------------------------------------------------------
+
+
+class _FakeConfig:
+    def __init__(self, model_type=None, architectures=None):
+        self.model_type = model_type
+        self.architectures = architectures or []
+
+
+class _FakeModel:
+    def __init__(self, model_type=None, architectures=None):
+        self.config = _FakeConfig(model_type=model_type, architectures=architectures)
+
+
+class TestAdapterSelection:
+    def test_selects_qwen3_adapter_for_qwen_models(self):
+        from coda_gqa_l import Qwen3CoDAAdapter
+
+        model = _FakeModel(model_type="qwen3")
+        assert _select_adapter_cls(model) is Qwen3CoDAAdapter
+
+    def test_selects_llama_adapter_for_llama_family_models(self):
+        from coda_gqa_l import LlamaCoDAAdapter
+
+        for model_type in ["llama", "mistral", "smollm", "smollm2"]:
+            model = _FakeModel(model_type=model_type)
+            assert _select_adapter_cls(model) is LlamaCoDAAdapter
+
+    def test_falls_back_to_architecture_name_when_model_type_missing(self):
+        from coda_gqa_l import LlamaCoDAAdapter
+
+        model = _FakeModel(architectures=["LlamaForCausalLM"])
+        assert _select_adapter_cls(model) is LlamaCoDAAdapter
+
+    def test_raises_for_unsupported_model_family(self):
+        model = _FakeModel(model_type="gpt2")
+
+        with pytest.raises(ValueError, match="Unsupported model family"):
+            _select_adapter_cls(model)

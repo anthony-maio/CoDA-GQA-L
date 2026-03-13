@@ -23,6 +23,9 @@ src/coda_gqa_l/
   state.py           CoDAGQALandmarkStatePerf2 dataclass (KV buffers, ring metadata, norm caches)
   primitives.py      HeadwiseRMSNorm, RotaryEmbedding, apply_rope, repeat_kv
   baseline.py        CoDAGQA (unbounded diff-attn), BaselineGQA (standard GQA)
+  triton_bank_routing.py  Fused exact-bank routing kernel (97x, Makora-evaluated)
+  triton_diff_flash.py    Fused differential FlashAttention kernel
+  triton_summary_bank.py  Fused summary bank update kernel (31x, Makora-generated)
   eve_adapter.py     EveCoDAAdapter (drop-in replacement for Eve-2 CausalSelfAttention)
   qwen3_adapter.py   Qwen3CoDAAdapter (drop-in for Qwen3 attention, rope_theta=1M)
 
@@ -201,7 +204,7 @@ Training notebook: `notebooks/colab_qwen3_coda.ipynb` (Colab Pro+ A100 40GB)
 
 ## Known Gaps
 
-- No fused differential attention kernel (compute is still ~2x streams)
+- Fused differential attention kernel exists (`triton_diff_flash.py`) but not yet integrated into attention.py (needs bf16 eval)
 - No distributed cache sharding (tensor parallel, sequence parallel)
 - No quantized KV storage
 - Bounded inference in eval_eve.py requires layer-by-layer state threading (TODO)
